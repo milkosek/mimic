@@ -1,0 +1,8 @@
+MIMIC (mimicache)
+Copyright 2026 Mateusz Milkowski
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+MIMIC implements the Redis serialization protocol (RESP) so that existing Redis
+clients can talk to it. It contains no Redis source code. Redis is a registered
+trademark of Redis Ltd.; MIMIC is not affiliated with or endorsed by Redis Ltd.

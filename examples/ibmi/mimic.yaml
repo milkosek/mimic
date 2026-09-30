@@ -1,0 +1,25 @@
+# Service Commander definition for MIMIC on IBM i.
+# https://github.com/ThePrez/ServiceCommander-IBMi
+#
+# Copy to $HOME/.sc/services/mimic.yaml (just you) or
+# /QOpenSys/etc/sc/services/mimic.yaml (everyone), then:
+#
+#   sc start mimic
+#   sc check mimic
+#   sc stop mimic
+#
+# Adjust `dir` to where you installed MIMIC.
+
+name: MIMIC cache (Redis-compatible)
+dir: /home/MYUSER/mimic
+start_cmd: node dist/cli.js
+check_alive: '6379'
+batch_mode: 'true'
+environment_vars:
+- PATH=/QOpenSys/pkgs/bin:/QOpenSys/usr/bin:/usr/ccs/bin:/QOpenSys/usr/bin/X11:/usr/sbin:.:/usr/bin
+- MIMIC_PORT=6379
+- MIMIC_HTTP_PORT=6380
+# Bind to 0.0.0.0 only if other systems must reach the cache, and then set a password:
+- MIMIC_HOST=127.0.0.1
+# Keep the password in an IFS file only the service profile can read (CHMOD 600):
+# - MIMIC_PASSWORD_FILE=/home/MYUSER/.mimic-password
