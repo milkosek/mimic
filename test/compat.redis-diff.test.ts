@@ -399,6 +399,29 @@ describe('MIMIC vs redis-server', { skip: hasRedis ? false : 'redis-server not i
       ['SCAN', '000000000000000000000000000000000000000000', 'COUNT', '1000'], ['SCAN', '99999999999999999999999'], ['SCAN', ' 1'],
     ]));
 
+  test('edge cases: integer ranges, CLIENT/CONFIG wording, RESP3 INFO', async () => {
+    await compare('edge', [
+      ['SELECT', '2147483648'], ['SELECT', '4294967296'], ['SELECT', '-2147483649'], ['SET', 'k', 'v'], ['MOVE', 'k', '2147483648'],
+      ['MOVE', 'k', '-1'], ['SWAPDB', '0', '2147483648'], ['SWAPDB', 'x', '1'], ['SWAPDB', '0', 'y'], ['SWAPDB', '0', '16'], ['SWAPDB', '-1', '0'],
+      ['CLIENT', 'SETNAME', 'a', 'b'], ['CLIENT', 'GETNAME', 'x'], ['CLIENT', 'ID', 'x'], ['CLIENT', 'INFO', 'x'], ['CLIENT', 'SETNAME'],
+      ['CLIENT', 'BOGUS'], ['CLIENT'], ['CONFIG', 'GET', 'DATABASES'], ['CONFIG', 'GET', 'Databases'], ['CONFIG', 'GET', 'data*'],
+      ['CONFIG', 'GET', 'nonexistent'],
+    ]);
+    await compare('edge resp3', [['INFO', 'keyspace'], ['SET', 'a', '1'], ['INFO', 'keyspace'], ['CONFIG', 'GET', 'DATABASES']], [['HELLO', '3']]);
+  });
+
+  for (const [name, raw] of [
+    ['multibulk leading zero', '*01\r\n$4\r\nPING\r\n'],
+    ['bulk leading zero', '*1\r\n$04\r\nPING\r\n'],
+    ['multibulk minus zero', '*-0\r\n'],
+    ['inline vertical tab', 'ECHO a\vb\r\n'],
+    ['inline form feed', 'ECHO a\fb\r\n'],
+    ['inline leading vertical tab', '\vPING\r\n'],
+    ['inline quote then vertical tab', 'ECHO "a"\vb\r\n'],
+  ] as [string, string][]) {
+    test(`protocol edge: ${name}`, () => compare(`protocol ${name}`, [raw, ['PING']]));
+  }
+
   test('inline commands', () =>
     compare('inline', [
       'SET greeting "hello world"\r\n', 'GET greeting\r\n', "SET q 'it\\'s'\r\n", 'GET q\r\n', 'SET e "a\\x41\\n\\t"\r\n', 'GET e\r\n',

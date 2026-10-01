@@ -21,5 +21,8 @@ environment_vars:
 - MIMIC_HTTP_PORT=6380
 # Bind to 0.0.0.0 only if other systems must reach the cache, and then set a password:
 - MIMIC_HOST=127.0.0.1
+# The cache lives on Node's heap: give it as much as you want MIMIC to use (MB).
+# Near this limit, writes get -OOM instead of the process crashing.
+- NODE_OPTIONS=--max-old-space-size=2048
 # Keep the password in an IFS file only the service profile can read (CHMOD 600):
 # - MIMIC_PASSWORD_FILE=/home/MYUSER/.mimic-password

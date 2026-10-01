@@ -19,11 +19,84 @@
 import { performance } from 'node:perf_hooks';
 import { Deque } from './deque.js';
 import { Keyspace } from './keyspace.js';
+import { MemoryGuard } from './memory.js';
 import { ReplyError, WrongTypeError } from './reply.js';
 import { checkInt64, globMatch, normaliseRange, toInt, toInt64 } from './util.js';
 
+// Below this size APPEND just concatenates JS strings; above it the value
+// moves into a growable byte buffer.
+const APPEND_BUFFER_MIN = 4096;
+
+/**
+ * A string value (one char per byte, see bytes.ts).
+ *
+ * Normally a plain JS string. A JS string grown with `+=` is a rope that V8
+ * re-flattens - copying the whole value - on the next slice, so the Redis
+ * time-series pattern "APPEND log x; GETRANGE log -10 -1" would be O(n) per
+ * round. Once a value grows past APPEND_BUFFER_MIN through APPEND it is kept
+ * in a buffer with spare capacity instead: APPEND is amortised O(1) and
+ * GETRANGE/STRLEN don't touch the rest of the value. Reading the whole value
+ * (GET) turns it back into a string.
+ */
+export class StringEntry {
+  readonly type = 'string' as const;
+  #str: string | null;
+  #buf: Buffer | null = null;
+  #len: number;
+
+  constructor(value: string) {
+    this.#str = value;
+    this.#len = value.length;
+  }
+
+  get value(): string {
+    if (this.#str === null) {
+      this.#str = this.#buf!.toString('latin1', 0, this.#len);
+      this.#buf = null;
+    }
+    return this.#str;
+  }
+
+  set value(v: string) {
+    this.#str = v;
+    this.#buf = null;
+    this.#len = v.length;
+  }
+
+  /** Length in bytes. */
+  get length(): number {
+    return this.#len;
+  }
+
+  /** Bytes [start, end) without materialising the whole value. */
+  slice(start: number, end: number): string {
+    return this.#buf ? this.#buf.toString('latin1', start, end) : this.#str!.slice(start, end);
+  }
+
+  append(suffix: string): number {
+    const needed = this.#len + suffix.length;
+    if (this.#buf === null) {
+      if (needed < APPEND_BUFFER_MIN) {
+        this.#str += suffix;
+        this.#len = needed;
+        return needed;
+      }
+      this.#buf = Buffer.allocUnsafe(Math.max(needed * 2, APPEND_BUFFER_MIN * 2));
+      this.#buf.write(this.#str!, 0, 'latin1');
+      this.#str = null;
+    } else if (needed > this.#buf.length) {
+      const grown = Buffer.allocUnsafe(Math.max(needed, this.#buf.length * 2));
+      this.#buf.copy(grown, 0, 0, this.#len);
+      this.#buf = grown;
+    }
+    this.#buf.write(suffix, this.#len, 'latin1');
+    this.#len = needed;
+    return needed;
+  }
+}
+
 export type Entry =
-  | { type: 'string'; value: string }
+  | StringEntry
   | { type: 'hash'; value: Map<string, string> }
   | { type: 'list'; value: Deque<string> };
 
@@ -41,6 +114,11 @@ export interface StoreOptions {
   timeBudgetMs?: number;
   /** Number of databases (Redis: databases 16). */
   databases?: number;
+  /**
+   * Refuse memory-growing writes (-OOM) once the V8 heap passes this
+   * percentage of its limit (like Redis' maxmemory + noeviction). 0 disables.
+   */
+  maxMemoryPercent?: number;
 }
 
 export interface SetOptions {
@@ -108,6 +186,7 @@ const DEFAULTS: Required<StoreOptions> = Object.freeze({
   repeatThreshold: 0.25,
   timeBudgetMs: 5,
   databases: 16,
+  maxMemoryPercent: 80,
 });
 
 export const invalidExpire = (cmd: string): ReplyError => new ReplyError(`invalid expire time in '${cmd}' command`);
@@ -336,7 +415,7 @@ export class Database {
 
     if ((opts.nx && existing) || (opts.xx && !existing)) return { written: false, previous };
 
-    this.#data.set(key, { type: 'string', value });
+    this.#data.set(key, new StringEntry(value));
     this.#touch(key);
     if (deadline !== undefined) this.#setDeadline(key, deadline);
     else if (!opts.keepttl) this.#expires.delete(key);
@@ -390,7 +469,7 @@ export class Database {
     const entry = this.#typed(key, 'string', false);
     const next = checkInt64((entry ? toInt64(entry.value) : 0n) + by);
     if (entry) entry.value = next.toString(); // keeps the TTL, like Redis
-    else this.#data.set(key, { type: 'string', value: next.toString() });
+    else this.#data.set(key, new StringEntry(next.toString()));
     this.#touch(key);
     return next;
   }
@@ -398,23 +477,20 @@ export class Database {
   append(key: string, suffix: string): number {
     const entry = this.#typed(key, 'string', false);
     this.#touch(key);
-    if (entry) {
-      entry.value += suffix;
-      return entry.value.length;
-    }
-    this.#data.set(key, { type: 'string', value: suffix });
+    if (entry) return entry.append(suffix);
+    this.#data.set(key, new StringEntry(suffix));
     return suffix.length;
   }
 
   strlen(key: string): number {
-    return this.#typed(key, 'string', false)?.value.length ?? 0;
+    return this.#typed(key, 'string', false)?.length ?? 0;
   }
 
   /** GETRANGE, with Redis' exact index rules (getrangeCommand in t_string.c). */
   getrange(key: string, start: number, end: number): string {
-    const value = this.get(key);
-    if (value === null) return '';
-    const len = value.length;
+    const entry = this.#typed(key, 'string');
+    if (!entry) return '';
+    const len = entry.length;
     if (start < 0 && end < 0 && start > end) return '';
     let s = start < 0 ? len + start : start;
     let e = end < 0 ? len + end : end;
@@ -422,7 +498,7 @@ export class Database {
     if (e < 0) e = 0; // unlike LRANGE, a too-negative end clamps to the first byte
     if (e >= len) e = len - 1;
     if (s > e || len === 0) return '';
-    return value.slice(s, e + 1);
+    return entry.slice(s, e + 1);
   }
 
   // ----------------------------------------------------------------------- keys
@@ -711,6 +787,8 @@ export class Store extends Database {
 
   readonly #dbs: Database[];
   readonly #state: Shared;
+  /** Heap watcher behind -OOM (Redis maxmemory with noeviction). */
+  readonly memory: MemoryGuard;
   #timer: NodeJS.Timeout | null = null;
   #nextDb = 0; // round-robin start for the active expire cycle, like Redis
 
@@ -727,6 +805,7 @@ export class Store extends Database {
     };
     super(0, shared);
     this.#state = shared;
+    this.memory = new MemoryGuard(options.maxMemoryPercent);
     this.#dbs = [this];
     for (let i = 1; i < options.databases; i++) this.#dbs.push(new Database(i, shared));
   }
@@ -758,6 +837,7 @@ export class Store extends Database {
       this.#timer = setInterval(() => {
         this.activeExpireCycle();
         for (const db of this.#dbs) db.rehashFor(1); // like Redis' serverCron
+        this.memory.refresh();
       }, this.#state.opts.cleanupIntervalMs);
       this.#timer.unref(); // never keep the process alive on its own
     }

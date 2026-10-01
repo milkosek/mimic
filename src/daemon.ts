@@ -42,6 +42,7 @@ export async function startDaemon(config: MimicConfig, logger: Logger = NOOP_LOG
     sampleSize: config.cleanupSampleSize,
     timeBudgetMs: config.cleanupTimeBudgetMs,
     databases: config.databases,
+    maxMemoryPercent: config.maxMemoryPercent,
   });
   // Only stop the timer later if this daemon started it (embedding code may own it).
   const startedTimer = !store.running;

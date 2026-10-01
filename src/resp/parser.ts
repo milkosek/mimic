@@ -66,12 +66,16 @@ const DOLLAR = 36;
 const MINUS = 45;
 const EMPTY = Buffer.alloc(0);
 
-/** Parse an ASCII integer in buf[start, end). NaN when malformed. */
+/**
+ * Parse an ASCII integer in buf[start, end) with Redis' string2ll() rules
+ * (no leading zeros, no "-0"). NaN when malformed.
+ */
 function parseIntAt(buf: Buffer, start: number, end: number): number {
   if (start >= end) return NaN;
   let i = start;
   const neg = buf[i] === MINUS;
   if (neg && ++i === end) return NaN;
+  if (buf[i] === 48 && (end - i > 1 || neg)) return NaN; // "03", "-0"
   let n = 0;
   for (; i < end; i++) {
     const d = buf[i]! - 48;
@@ -82,7 +86,10 @@ function parseIntAt(buf: Buffer, start: number, end: number): number {
   return neg ? -n : n;
 }
 
+// C isspace(): skips between arguments and decides what may follow a closing quote.
 const isSpace = (c: string | undefined): boolean => c === ' ' || c === '\n' || c === '\r' || c === '\t' || c === '\v' || c === '\f';
+// What ends an unquoted argument in sdssplitargs (\v and \f do not).
+const endsToken = (c: string): boolean => c === ' ' || c === '\n' || c === '\r' || c === '\t' || c === '\0';
 const isHex = (c: string | undefined): boolean => c !== undefined && /^[0-9a-fA-F]$/.test(c);
 const ESCAPES: Record<string, string> = { n: '\n', r: '\r', t: '\t', b: '\b', a: '\x07' };
 
@@ -130,7 +137,7 @@ export function splitArgs(line: string): string[] | null {
         } else {
           cur += c;
         }
-      } else if (c === undefined || isSpace(c) || c === '\0') {
+      } else if (c === undefined || endsToken(c)) {
         done = true;
       } else if (c === '"') {
         inDouble = true;

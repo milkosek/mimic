@@ -4,9 +4,10 @@
 // (including the command name; negative = "at least"), which drives argument
 // validation and the COMMAND reply that clients may introspect.
 
-import { MapReply, NULL_ARRAY, OK, PONG, ReplyError, SimpleString, syntaxError, type Reply } from './reply.js';
+import { MapReply, NULL_ARRAY, OK, PONG, ReplyError, SimpleString, syntaxError, VerbatimString, type Reply } from './reply.js';
 import { checkExpireFlags, invalidExpire, type Database, type ExpireOptions, type Store } from './store.js';
 import { globMatch, toInt, toInt64 } from './util.js';
+import { OOM_MESSAGE } from './memory.js';
 import { NAME, REDIS_COMPAT_VERSION, VERSION } from './version.js';
 
 /** What a transport (the RESP server) exposes about the current connection. */
@@ -212,6 +213,14 @@ function flushArgs(args: string[]): void {
 
 const dbInRange = (ctx: CommandContext, index: number): boolean => index >= 0 && index < ctx.store.databases;
 
+// Redis' getIntFromObjectOrReply(): a 64-bit integer that must also fit in 32 bits.
+const INT32_RANGE = 'value is out of range, value must between -2147483648 and 2147483647';
+function toInt32(v: string, err?: () => ReplyError): number {
+  const n = toInt(v, err);
+  if (n < -2147483648 || n > 2147483647) throw err ? err() : new ReplyError(INT32_RANGE);
+  return n;
+}
+
 function needConn(ctx: CommandContext): ConnectionHandle {
   if (!ctx.conn) throw new ReplyError('this command is only available over the RESP protocol');
   return ctx.conn;
@@ -243,8 +252,11 @@ function formatInfo(ctx: CommandContext, wanted: string[]): string {
       used_memory_human: human(s.heapUsedBytes),
       used_memory_rss: mem.rss,
       used_memory_rss_human: human(mem.rss),
-      maxmemory: 0,
+      maxmemory: ctx.store.memory.limitBytes,
+      maxmemory_human: human(ctx.store.memory.limitBytes),
       maxmemory_policy: 'noeviction',
+      [`${NAME}_heap_old_generation`]: ctx.store.memory.usedBytes,
+      [`${NAME}_heap_limit`]: ctx.store.memory.heapLimitBytes,
     },
     Persistence: { loading: 0, rdb_bgsave_in_progress: 0, aof_enabled: 0 },
     Stats: {
@@ -278,7 +290,7 @@ function formatInfo(ctx: CommandContext, wanted: string[]): string {
 function configParams(ctx: CommandContext): Record<string, string> {
   const c = ctx.store.info().config;
   return {
-    maxmemory: '0',
+    maxmemory: String(ctx.store.memory.limitBytes),
     'maxmemory-policy': 'noeviction',
     save: '',
     appendonly: 'no',
@@ -304,6 +316,9 @@ const spec = (arity: number, flags: string[], keys: [number, number, number], ru
 
 const R = ['readonly', 'fast'];
 const W = ['write', 'fast'];
+// Redis' denyoom: refused with -OOM when over the memory limit (see memory.ts).
+const WD = ['write', 'denyoom', 'fast'];
+const WDS = ['write', 'denyoom'];
 
 export const COMMANDS: Record<string, CommandSpec> = {
   // connection / server
@@ -316,13 +331,13 @@ export const COMMANDS: Record<string, CommandSpec> = {
     const ms = Date.now();
     return [String(Math.floor(ms / 1000)), String((ms % 1000) * 1000)];
   }),
-  INFO: spec(-1, [], NOKEYS, (ctx, a) => formatInfo(ctx, a)),
+  INFO: spec(-1, [], NOKEYS, (ctx, a) => new VerbatimString(formatInfo(ctx, a))),
   DBSIZE: spec(1, R, NOKEYS, (ctx) => ctx.db.dbsize()),
-  FLUSHALL: spec(-1, ['write'], NOKEYS, (ctx, a) => (flushArgs(a), ctx.store.flushall(), OK)),
-  FLUSHDB: spec(-1, ['write'], NOKEYS, (ctx, a) => (flushArgs(a), ctx.db.flushdb(), OK)),
+  FLUSHALL: spec(-1, ['write'], NOKEYS, (ctx, a) => (flushArgs(a), ctx.store.flushall(), ctx.store.memory.freed(), OK)),
+  FLUSHDB: spec(-1, ['write'], NOKEYS, (ctx, a) => (flushArgs(a), ctx.db.flushdb(), ctx.store.memory.freed(), OK)),
   SWAPDB: spec(3, ['write', 'fast'], NOKEYS, (ctx, a) => {
-    const first = toInt(a[0]!, () => new ReplyError('invalid first DB index'));
-    const second = toInt(a[1]!, () => new ReplyError('invalid second DB index'));
+    const first = toInt32(a[0]!, () => new ReplyError('invalid first DB index'));
+    const second = toInt32(a[1]!, () => new ReplyError('invalid second DB index'));
     if (!dbInRange(ctx, first) || !dbInRange(ctx, second)) throw new ReplyError('DB index is out of range');
     ctx.store.swapdb(first, second);
     return OK;
@@ -333,8 +348,18 @@ export const COMMANDS: Record<string, CommandSpec> = {
     if (sub === 'GET') {
       if (a.length < 2) throw new ReplyError("wrong number of arguments for 'config|get' command");
       const params = configParams(ctx);
-      const patterns = a.slice(1);
-      return new MapReply(Object.entries(params).filter(([k]) => patterns.some((p) => globMatch(p, k, true))));
+      // Like Redis: a plain name is looked up case-insensitively and echoed as
+      // given; a glob returns the canonical (lower-case) names that match.
+      const out = new Map<string, string>();
+      for (const p of a.slice(1)) {
+        if (!/[*?[]/.test(p)) {
+          const value = params[p.toLowerCase()];
+          if (value !== undefined) out.set(p, value);
+        } else {
+          for (const [k, v] of Object.entries(params)) if (globMatch(p, k, true)) out.set(k, v);
+        }
+      }
+      return new MapReply([...out]);
     }
     if (sub === 'RESETSTAT') return OK;
     if (sub === 'SET') throw new ReplyError('CONFIG SET is not supported; configure MIMIC with flags or MIMIC_* environment variables');
@@ -413,7 +438,7 @@ export const COMMANDS: Record<string, CommandSpec> = {
   UNWATCH: spec(1, ['fast'], NOKEYS, (ctx) => (needConn(ctx), OK)),
   SELECT: spec(2, ['fast'], NOKEYS, (ctx, a) => {
     const conn = needConn(ctx);
-    const index = toInt(a[0]!);
+    const index = toInt32(a[0]!);
     if (!dbInRange(ctx, index)) throw new ReplyError('DB index is out of range');
     conn.db = index;
     return OK;
@@ -421,19 +446,24 @@ export const COMMANDS: Record<string, CommandSpec> = {
   CLIENT: spec(-2, [], NOKEYS, (ctx, a) => {
     const conn = needConn(ctx);
     const sub = a[0]!.toUpperCase();
+    // Subcommand arity, total argument count as in Redis (negative = at least).
+    const arity: Record<string, number> = { ID: 2, GETNAME: 2, SETNAME: 3, SETINFO: 4, INFO: 2, LIST: -2 };
+    const want = arity[sub];
+    const total = a.length + 1;
+    if (want !== undefined && (want > 0 ? total !== want : total < -want)) {
+      throw new ReplyError(`wrong number of arguments for 'client|${sub.toLowerCase()}' command`);
+    }
     switch (sub) {
       case 'ID':
         return conn.id;
       case 'GETNAME':
         return conn.name || null;
       case 'SETNAME':
-        if (a.length !== 2) throw syntaxError();
         // Redis allows only printable ASCII without spaces ('!' .. '~').
         if (/[^!-~]/.test(a[1]!)) throw new ReplyError('Client names cannot contain spaces, newlines or special characters.');
         conn.name = a[1]!;
         return OK;
       case 'SETINFO': {
-        if (a.length !== 3) throw syntaxError();
         const attr = a[1]!.toUpperCase();
         if (attr === 'LIB-NAME') conn.libName = a[2]!;
         else if (attr === 'LIB-VER') conn.libVer = a[2]!;
@@ -441,29 +471,29 @@ export const COMMANDS: Record<string, CommandSpec> = {
         return OK;
       }
       case 'INFO':
-        return `${conn.describe()}\n`;
+        return new VerbatimString(`${conn.describe()}\n`);
       case 'LIST':
-        return conn.listAll();
+        return new VerbatimString(conn.listAll());
       default:
         throw new ReplyError(`unknown subcommand '${a[0]}'. Try CLIENT HELP.`);
     }
   }),
 
   // strings
-  SET: spec(-3, ['write'], K1, ({ db }, a) => {
+  SET: spec(-3, WDS, K1, ({ db }, a) => {
     const o = parseExtendedOptions(a.slice(2), 'set');
     const pxat = o.expire ? setStyleDeadline(o.expire, 'set') : undefined;
     const r = db.set(a[0]!, a[1]!, { nx: !!o.nx, xx: !!o.xx, get: !!o.get, keepttl: !!o.keepttl, ...(pxat !== undefined ? { pxat } : {}) });
     if (o.get) return r.previous;
     return r.written ? OK : null;
   }),
-  SETNX: spec(3, W, K1, ({ db }, a) => (db.set(a[0]!, a[1]!, { nx: true }).written ? 1 : 0)),
-  SETEX: spec(4, ['write'], K1, ({ db }, a) => {
+  SETNX: spec(3, WD, K1, ({ db }, a) => (db.set(a[0]!, a[1]!, { nx: true }).written ? 1 : 0)),
+  SETEX: spec(4, WDS, K1, ({ db }, a) => {
     const pxat = setStyleDeadline({ kind: 'EX', raw: a[1]! }, 'setex');
     db.set(a[0]!, a[2]!, { pxat });
     return OK;
   }),
-  PSETEX: spec(4, ['write'], K1, ({ db }, a) => {
+  PSETEX: spec(4, WDS, K1, ({ db }, a) => {
     const pxat = setStyleDeadline({ kind: 'PX', raw: a[1]! }, 'psetex');
     db.set(a[0]!, a[2]!, { pxat });
     return OK;
@@ -479,20 +509,20 @@ export const COMMANDS: Record<string, CommandSpec> = {
     else if (o.persist) db.getex(a[0]!, { persist: true }, false);
     return value;
   }),
-  GETSET: spec(3, W, K1, ({ db }, a) => db.set(a[0]!, a[1]!, { get: true }).previous),
+  GETSET: spec(3, WD, K1, ({ db }, a) => db.set(a[0]!, a[1]!, { get: true }).previous),
   GETRANGE: spec(4, R, K1, ({ db }, a) => db.getrange(a[0]!, int(a[1]!), int(a[2]!))),
   MGET: spec(-2, R, ALLKEYS, ({ db }, a) => db.mget(a)),
-  MSET: spec(-3, ['write'], [1, -1, 2], ({ db }, a) => (db.mset(pairs('mset', a)), OK)),
-  MSETNX: spec(-3, ['write'], [1, -1, 2], ({ db }, a) => (db.msetnx(pairs('msetnx', a)) ? 1 : 0)),
-  INCR: spec(2, W, K1, ({ db }, a) => db.incrby(a[0]!, 1n)),
-  DECR: spec(2, W, K1, ({ db }, a) => db.incrby(a[0]!, -1n)),
-  INCRBY: spec(3, W, K1, ({ db }, a) => db.incrby(a[0]!, bigint(a[1]!))),
-  DECRBY: spec(3, W, K1, ({ db }, a) => {
+  MSET: spec(-3, WDS, [1, -1, 2], ({ db }, a) => (db.mset(pairs('mset', a)), OK)),
+  MSETNX: spec(-3, WDS, [1, -1, 2], ({ db }, a) => (db.msetnx(pairs('msetnx', a)) ? 1 : 0)),
+  INCR: spec(2, WD, K1, ({ db }, a) => db.incrby(a[0]!, 1n)),
+  DECR: spec(2, WD, K1, ({ db }, a) => db.incrby(a[0]!, -1n)),
+  INCRBY: spec(3, WD, K1, ({ db }, a) => db.incrby(a[0]!, bigint(a[1]!))),
+  DECRBY: spec(3, WD, K1, ({ db }, a) => {
     const by = bigint(a[1]!);
     if (by === -(2n ** 63n)) throw new ReplyError('decrement would overflow');
     return db.incrby(a[0]!, -by);
   }),
-  APPEND: spec(3, W, K1, ({ db }, a) => db.append(a[0]!, a[1]!)),
+  APPEND: spec(3, WD, K1, ({ db }, a) => db.append(a[0]!, a[1]!)),
   STRLEN: spec(2, R, K1, ({ db }, a) => db.strlen(a[0]!)),
 
   // keys
@@ -508,7 +538,7 @@ export const COMMANDS: Record<string, CommandSpec> = {
   }),
   RENAME: spec(3, ['write'], [1, 2, 1], ({ db }, a) => (db.rename(a[0]!, a[1]!), OK)),
   MOVE: spec(3, W, K1, (ctx, a) => {
-    const target = toInt(a[1]!);
+    const target = toInt32(a[1]!);
     if (!dbInRange(ctx, target)) throw new ReplyError('DB index is out of range');
     return ctx.store.move(a[0]!, ctx.db.index, target);
   }),
@@ -548,9 +578,9 @@ export const COMMANDS: Record<string, CommandSpec> = {
   PERSIST: spec(2, W, K1, ({ db }, a) => db.persist(a[0]!)),
 
   // hashes
-  HSET: spec(-4, W, K1, ({ db }, a) => db.hset(a[0]!, pairs('hset', a, 1))),
-  HMSET: spec(-4, W, K1, ({ db }, a) => (db.hset(a[0]!, pairs('hmset', a, 1)), OK)),
-  HSETNX: spec(4, W, K1, ({ db }, a) => db.hsetnx(a[0]!, a[1]!, a[2]!)),
+  HSET: spec(-4, WD, K1, ({ db }, a) => db.hset(a[0]!, pairs('hset', a, 1))),
+  HMSET: spec(-4, WD, K1, ({ db }, a) => (db.hset(a[0]!, pairs('hmset', a, 1)), OK)),
+  HSETNX: spec(4, WD, K1, ({ db }, a) => db.hsetnx(a[0]!, a[1]!, a[2]!)),
   HGET: spec(3, R, K1, ({ db }, a) => db.hget(a[0]!, a[1]!)),
   HMGET: spec(-3, R, K1, ({ db }, a) => db.hmget(a[0]!, a.slice(1))),
   HDEL: spec(-3, W, K1, ({ db }, a) => db.hdel(a[0]!, a.slice(1))),
@@ -559,11 +589,11 @@ export const COMMANDS: Record<string, CommandSpec> = {
   HLEN: spec(2, R, K1, ({ db }, a) => db.hlen(a[0]!)),
   HKEYS: spec(2, ['readonly'], K1, ({ db }, a) => db.hkeys(a[0]!)),
   HVALS: spec(2, ['readonly'], K1, ({ db }, a) => db.hvals(a[0]!)),
-  HINCRBY: spec(4, W, K1, ({ db }, a) => db.hincrby(a[0]!, a[1]!, bigint(a[2]!))),
+  HINCRBY: spec(4, WD, K1, ({ db }, a) => db.hincrby(a[0]!, a[1]!, bigint(a[2]!))),
 
   // lists
-  LPUSH: spec(-3, W, K1, ({ db }, a) => db.lpush(a[0]!, a.slice(1))),
-  RPUSH: spec(-3, W, K1, ({ db }, a) => db.rpush(a[0]!, a.slice(1))),
+  LPUSH: spec(-3, WD, K1, ({ db }, a) => db.lpush(a[0]!, a.slice(1))),
+  RPUSH: spec(-3, WD, K1, ({ db }, a) => db.rpush(a[0]!, a.slice(1))),
   LPOP: spec(-2, W, K1, ({ db }, a) => {
     if (a.length > 2) throw new ReplyError("wrong number of arguments for 'lpop' command");
     if (a[1] === undefined) return db.lpop(a[0]!);
@@ -640,5 +670,15 @@ export function commandKeys(spec: CommandSpec, argv: string[]): string[] {
  * Throws ReplyError for anything the client should see as an error reply.
  */
 export function execute(ctx: CommandContext, argv: string[]): Reply {
-  return resolveCommand(argv).run(ctx, argv.slice(1));
+  const spec = resolveCommand(argv);
+  checkMemory(ctx, spec, argv);
+  return spec.run(ctx, argv.slice(1));
+}
+
+/** Refuse a memory-growing command while the store is over its memory limit (Redis: -OOM). */
+export function checkMemory(ctx: CommandContext, spec: CommandSpec, argv: readonly string[]): void {
+  if (!spec.flags.includes('denyoom')) return;
+  let bytes = 0;
+  for (let i = 1; i < argv.length; i++) bytes += argv[i]!.length;
+  if (ctx.store.memory.overLimit(bytes)) throw new ReplyError(OOM_MESSAGE, 'OOM');
 }

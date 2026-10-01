@@ -68,14 +68,19 @@ export class Deque<T> {
     return out;
   }
 
-  /** Keep only [start, end) (LTRIM). */
+  /**
+   * Keep only [start, end) (LTRIM). Costs O(items removed), like Redis: the
+   * common "LRANGE q 0 99, LTRIM q 100 -1" batch pattern touches 100 slots,
+   * not the whole list.
+   */
   keep(start: number, end: number): void {
-    const items = this.slice(start, end);
-    this.#buf = new Array(8);
-    this.#mask = 7;
-    this.#head = 0;
-    this.#len = 0;
-    for (const item of items) this.push(item);
+    const s = Math.max(0, Math.min(start, this.#len));
+    const e = Math.max(s, Math.min(end, this.#len));
+    for (let i = e; i < this.#len; i++) this.#buf[(this.#head + i) & this.#mask] = undefined; // drop the tail
+    for (let i = 0; i < s; i++) this.#buf[(this.#head + i) & this.#mask] = undefined; // drop the head
+    this.#head = (this.#head + s) & this.#mask;
+    this.#len = e - s;
+    this.#maybeShrink();
   }
 
   toArray(): T[] {
@@ -87,7 +92,9 @@ export class Deque<T> {
   }
 
   #maybeShrink(): void {
-    if (this.#buf.length > 64 && this.#len < this.#buf.length / 4) this.#resize(this.#buf.length / 2);
+    let capacity = this.#buf.length;
+    while (capacity > 64 && this.#len < capacity / 4) capacity /= 2;
+    if (capacity !== this.#buf.length) this.#resize(capacity);
   }
 
   #resize(capacity: number): void {

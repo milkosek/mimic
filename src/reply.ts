@@ -23,6 +23,14 @@ export class SimpleString {
 
 export const OK = new SimpleString('OK');
 
+/** Text meant for humans (INFO, CLIENT INFO/LIST): RESP3 verbatim string `=…txt:`, RESP2 bulk string. */
+export class VerbatimString {
+  constructor(readonly value: string) {}
+  toJSON(): string {
+    return this.value;
+  }
+}
+
 /** A null *array* (RESP2 `*-1`, RESP3 `_`): EXEC aborted by WATCH, LPOP key count on a missing key. */
 export class NullArray {
   toJSON(): null {
@@ -37,7 +45,7 @@ export class MapReply {
   constructor(readonly entries: [Reply, Reply][]) {}
 }
 
-export type Reply = string | number | bigint | null | NullArray | SimpleString | ReplyError | MapReply | Reply[];
+export type Reply = string | number | bigint | null | NullArray | VerbatimString | SimpleString | ReplyError | MapReply | Reply[];
 
 // Error codes that may already start a message. Anything else gets "ERR "
 // (e.g. "GT and LT options ..." or "MULTI calls can not be nested" are ERR errors).

@@ -15,7 +15,7 @@ Redis is great, but you can't always install it. **IBM i (PASE)** is the classic
 - **An HTTP/JSON API as well**, for callers that have no Redis client, such as RPG or SQL on IBM i (through the `QSYS2.HTTP_*` functions), shell scripts or health checks.
 - **Memory only, on purpose.** Redis writes snapshots to disk by default. MIMIC never persists anything: a restart gives you an empty cache. It really is *merely* an in-memory cache.
 
-> Status: pre-release (0.2.0). It isn't on npm yet; it will be published as `mimicache` (the name `mimic` is taken). See [Install](#install).
+> Status: pre-release (0.2.1). It isn't on npm yet; it will be published as `mimicache` (the name `mimic` is taken). See [Install](#install).
 
 ---
 
@@ -92,6 +92,7 @@ Tips:
 - Several applications can share one MIMIC without key clashes by each using its own database: `db: 2` in the client, `SELECT 2`, or `?db=2` over HTTP.
 - Log lines go to stdout/stderr with ISO timestamps. Service Commander keeps them in its log file.
 - `SIGTERM` or `SIGINT` (for example `sc stop`) shuts down cleanly.
+- **Size the heap.** Everything MIMIC stores lives on Node's V8 heap, and Node's default ceiling may be well below what the partition can spare. Raise it with `node --max-old-space-size=4096 dist/cli.js` (in MB), or `NODE_OPTIONS=--max-old-space-size=4096` in the Service Commander file. See [Memory](#memory).
 
 ## Connecting from your code
 
@@ -153,6 +154,7 @@ An empty password is a startup error, whether it comes from `--password=`, an `M
 | `--http-body-limit` | `MIMIC_HTTP_BODY_LIMIT` | 1 MB | Largest HTTP request body (larger gets a 413) |
 | `--http-allowed-origins` | `MIMIC_HTTP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call the HTTP API |
 | `--http-allowed-hosts` | `MIMIC_HTTP_ALLOWED_HOSTS` | none | Extra `Host` names the HTTP API accepts when no password is set |
+| `--max-memory-percent` | `MIMIC_MAX_MEMORY_PERCENT` | `80` | Refuse writes with `-OOM` above this share of the V8 heap limit, `0` = off. See [Memory](#memory) |
 | `--cleanup-interval` | `MIMIC_CLEANUP_INTERVAL_MS` | `100` | How often active expiry runs, in ms |
 | `--cleanup-sample-size` | `MIMIC_CLEANUP_SAMPLE_SIZE` | `20` | Keys checked per expiry batch |
 | `--cleanup-time-budget` | `MIMIC_CLEANUP_TIME_BUDGET_MS` | `5` | Max ms per expiry cycle |
@@ -160,13 +162,28 @@ An empty password is a startup error, whether it comes from `--password=`, an `M
 
 `mimic --help` prints the same list.
 
+### Memory
+
+Everything MIMIC stores lives on the V8 heap, which has a hard ceiling: `--max-old-space-size`, or a default Node picks from the machine (`node -p "v8.getHeapStatistics().heap_size_limit/2**20"` prints it in MB). If the heap hits that ceiling, Node aborts and the whole cache is gone.
+
+So MIMIC behaves like Redis with `maxmemory` and the `noeviction` policy. Once the heap passes `--max-memory-percent` of the ceiling (default 80%, and always at least 32 MB below it so V8 has room to collect), commands that grow memory (`SET`, `LPUSH`, `HSET`, `APPEND`, …) get Redis' own error:
+
+```
+-OOM command not allowed when used memory > 'maxmemory'.
+```
+
+Reads, deletes, `EXPIRE` and `FLUSHDB`/`FLUSHALL` keep working, and writes are accepted again as soon as memory is freed. Clients handle this like a full Redis. `INFO memory` shows `maxmemory` (the threshold) and `mimic_heap_limit` (the ceiling), and `CONFIG GET maxmemory` returns the threshold.
+
+Give MIMIC the heap you want it to use, for example `node --max-old-space-size=4096 dist/cli.js` for 4 GB, and leave headroom on the machine for Node itself. One very large command can still exceed the ceiling on a tiny heap (a 64 MB value on a 64 MB heap), so keep `--max-bulk-bytes` well below the heap size.
+
 ## HTTP API
 
 The HTTP API sends and receives JSON. JSON strings are UTF-8 text, and MIMIC stores them as their UTF-8 bytes, exactly as a Redis client would.
 
 - **Request bodies must be sent with `Content-Type: application/json`.** Anything else gets a 415. This blocks web pages from writing to the cache; see [Security](#security).
 - **Every route except `/health` accepts `?db=N`** to choose the database (default 0).
-- **Integer replies are always JSON numbers,** written with full 64-bit precision (for example `{"result":9223372036854775807}`). Plain `JSON.parse` in JavaScript rounds values above 2^53, so use a BigInt-aware parser if you work with counters that large. In requests, send big numbers as strings: `["INCRBY","k","9007199254740993"]`.
+- **Integer replies are always JSON numbers,** written with full 64-bit precision (for example `{"result":9223372036854775807}`). Plain `JSON.parse` in JavaScript rounds values above 2^53, so use a BigInt-aware parser if you work with counters that large.
+- **In requests, send big integers as strings:** `["INCRBY","k","9007199254740993"]`. JSON parsers round integers above 2^53 (9007199254740993 becomes 9007199254740992), so MIMIC refuses a request containing one with a 400 rather than store a silently changed value. From Db2 SQL, that means building such numbers as `VARCHAR`, not `BIGINT`.
 
 | Route | Body | Result |
 |---|---|---|
@@ -205,12 +222,13 @@ For the commands MIMIC implements, replies and error messages match Redis 7.0 by
 What is different:
 
 - **No persistence, replication or cluster.** MIMIC is a cache, and a restart empties it.
-- **No eviction yet.** Memory grows until keys expire or are deleted. Set TTLs on cached data.
+- **No eviction yet.** Memory grows until keys expire or are deleted; near the heap limit, writes get `-OOM` (see [Memory](#memory)). Set TTLs on cached data. `maxmemory` itself is derived from the heap limit and can't be changed with `CONFIG SET`.
 - **Not implemented yet:** sets, sorted sets, streams, pub/sub, blocking commands (`BLPOP`…), Lua scripting, `CONFIG SET`, ACL users (a single password only). They get the standard `ERR unknown command` reply.
 - **RESP3:** replies use maps and `_` nulls. There are no push messages, because there's no pub/sub.
 - **`SCAN` cursors** walk a 32-bit space; larger cursors are accepted and reduced to their low 32 bits.
-- **Expire times beyond 2^53 ms** (around the year 287,000) are capped. Redis would store them exactly.
-- **Over the query-buffer limit,** MIMIC sends an error before closing the connection; Redis just closes it.
+- **Expire times beyond 2^53 ms** (around the year 287,000) are capped. Redis would store them exactly. `TTL` on such a key differs from Redis, but nothing expires early.
+- **`CLIENT SETINFO`** (a Redis 7.2 command) is accepted so newer clients connect without warnings, and `CLIENT INFO`/`LIST` show `lib-name`/`lib-ver` as 7.2 does.
+- **Pauses on very large keyspaces:** see [How it works](#how-it-works). At several million keys, expect occasional pauses of a few hundred milliseconds.
 - **Malformed frames:** MIMIC is a little stricter than Redis. For example, a bulk string not followed by CRLF is a protocol error, where Redis skips two bytes. Well-formed clients never notice.
 - **Glob ranges with bytes ≥ 0x80** (such as `[a-\xff]`) compare bytes as unsigned. Redis on x86 compares them as signed `char`, so results can differ for such ranges; Redis on ARM agrees with MIMIC.
 - **`INFO`** reports `redis_version:7.0.0` so client feature detection works, plus `mimic_version`. `avg_ttl` is always 0.
@@ -294,7 +312,7 @@ src/
 
 ## Roadmap
 
-- `maxmemory` with LRU/LFU eviction
+- LRU/LFU eviction on top of the memory limit
 - Sets and sorted sets, `HSCAN`
 - Pub/Sub and keyspace notifications
 - Prometheus `/metrics`

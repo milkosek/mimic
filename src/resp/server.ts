@@ -15,12 +15,15 @@
 //     web page) drops the connection before anything else runs.
 
 import net from 'node:net';
-import { NO_AUTH_COMMANDS, resolveCommand, type CommandSpec, type ConnectionHandle, type InfoSections } from '../commands.js';
+import { checkMemory, NO_AUTH_COMMANDS, resolveCommand, type CommandSpec, type ConnectionHandle, type InfoSections } from '../commands.js';
+import { OOM_MESSAGE } from '../memory.js';
 import { NULL_ARRAY, OK, ReplyError, SimpleString, type Reply } from '../reply.js';
 import type { Store } from '../store.js';
 import { safeEqual } from '../util.js';
 import { encode, encodeError } from './encoder.js';
 import { DEFAULT_LIMITS, ProtocolError, RespParser, UNAUTHENTICATED_LIMITS, type ParserLimits } from './parser.js';
+
+const OOM_ERROR = `OOM ${OOM_MESSAGE}`;
 
 export interface Logger {
   info(msg: string): void;
@@ -107,7 +110,12 @@ class Connection implements ConnectionHandle {
   db = 0;
   protocol: 2 | 3 = 2;
   closing = false;
-  waitingForDrain = false; // output is backed up: stop running commands until 'drain'
+  // Output is backed up: stop *running* commands until 'drain'. We keep
+  // reading input, though: synchronous clients (redis-py, Predis, Jedis)
+  // send a whole pipeline before reading any reply, so if we stopped reading
+  // both sides would wait for each other forever. --max-query-buffer bounds
+  // what can pile up meanwhile.
+  waitingForDrain = false;
   // transaction state
   multi: string[][] | null = null;
   multiBytes = 0; // size of the queued commands (counts against the query buffer limit)
@@ -159,8 +167,16 @@ class Connection implements ConnectionHandle {
       `name=${this.name}`,
       `age=${Math.floor((now - this.createdAt) / 1000)}`,
       `idle=${Math.floor((now - this.lastActive) / 1000)}`,
+      `flags=${this.multi ? 'x' : 'N'}`,
       `db=${this.db}`,
+      'sub=0',
+      'psub=0',
+      'ssub=0',
+      `multi=${this.multi ? this.multi.length : -1}`,
       `cmd=${this.lastCommand.toLowerCase()}`,
+      'user=default',
+      'redir=-1',
+      `resp=${this.protocol}`,
       `lib-name=${this.libName}`,
       `lib-ver=${this.libVer}`,
     ].join(' ');
@@ -247,9 +263,11 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
   };
 
   /** Run a resolved command; errors become error replies. */
-  function dispatch(conn: Connection, argv: string[], spec: CommandSpec): Reply {
+  function dispatch(conn: Connection, argv: string[], spec: CommandSpec, guardMemory = true): Reply {
     try {
-      return spec.run({ store, db: store.db(conn.db), conn, serverInfo }, argv.slice(1));
+      const ctx = { store, db: store.db(conn.db), conn, serverInfo };
+      if (guardMemory) checkMemory(ctx, spec, argv);
+      return spec.run(ctx, argv.slice(1));
     } catch (err) {
       if (err instanceof ReplyError) return err;
       logger?.error(`[resp] command ${argv[0]} failed`, err);
@@ -268,15 +286,22 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     const failed = conn.multiError;
     const aborted = conn.dirty;
     discard(conn);
+    // Like Redis, EXEC of a transaction with memory-growing commands is itself
+    // refused while over the limit; once running, the queued commands are not
+    // re-checked (all or nothing).
+    if (store.memory.enabled && queued.some((argv) => resolveCommand(argv).flags.includes('denyoom')) && store.memory.overLimit()) {
+      return new ReplyError(`Transaction discarded because of: ${OOM_ERROR}`, 'EXECABORT');
+    }
     if (failed) return new ReplyError('Transaction discarded because of previous errors.', 'EXECABORT');
     if (aborted) return NULL_ARRAY; // a watched key changed: the client retries
     // Node runs this loop without yielding, so the transaction is atomic.
-    return queued.map((argv) => dispatch(conn, argv, resolveCommand(argv)));
+    return queued.map((argv) => dispatch(conn, argv, resolveCommand(argv), false));
   }
 
   function run(conn: Connection, argv: string[]): Reply {
     const name = argv[0]!.toUpperCase();
-    conn.lastCommand = name;
+    // CLIENT INFO shows subcommands as Redis does, e.g. "client|info".
+    conn.lastCommand = (name === 'CLIENT' || name === 'CONFIG' || name === 'COMMAND') && argv[1] ? `${name}|${argv[1]}` : name;
     stats.totalCommands++;
 
     // Same order as Redis' processCommand(): unknown command and arity errors
@@ -299,6 +324,16 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     }
 
     if (conn.multi) {
+      // Redis 7.0: while over the memory limit, queuing anything (even GET:
+      // the queue itself grows) is refused and fails the transaction.
+      if (name !== 'EXEC' && name !== 'DISCARD' && name !== 'QUIT' && name !== 'RESET' && store.memory.enabled) {
+        let bytes = 0;
+        for (const a of argv) bytes += a.length;
+        if (store.memory.overLimit(bytes)) {
+          conn.multiError = true;
+          return new ReplyError(OOM_ERROR);
+        }
+      }
       switch (name) {
         case 'EXEC':
           return exec(conn);
@@ -362,7 +397,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
 
   /**
    * Run every complete command the parser has, writing replies as we go. Stops
-   * early when the socket's buffer is full (resumed on 'drain'), when the
+   * early when the socket's buffer is full (continued on 'drain'), when the
    * connection is closing, or when more input is needed.
    */
   function pump(conn: Connection, parser: RespParser): void {
@@ -399,8 +434,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
         }
         if (out.length + reply.length > WRITE_CHUNK && !flush()) {
           out = reply;
-          conn.waitingForDrain = true;
-          socket.pause(); // backpressure: don't read or run more until the client drains replies
+          conn.waitingForDrain = true; // backpressure: run nothing more until the client drains replies
           break;
         }
         out += reply;
@@ -428,8 +462,18 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
       finishClose(conn, out, silent);
     } else if (!flush()) {
       conn.waitingForDrain = true;
-      socket.pause();
     }
+  }
+
+  /** Input arriving while replies are backed up: buffer it, within the query buffer limit. */
+  function bufferWhileBlocked(conn: Connection, parser: RespParser): void {
+    const held = parser.buffered + conn.multiBytes;
+    if (held <= maxQueryBuffer) return;
+    logger?.warn(`[resp] closing client ${conn.id}: query buffer of ${held} bytes exceeds the limit (client is not reading replies)`);
+    conn.closing = true;
+    conn.waitingForDrain = false;
+    // Like Redis (freeClientAsync): no reply, the client is not reading anyway.
+    finishClose(conn, '', true);
   }
 
   const server = net.createServer((socket) => {
@@ -460,13 +504,13 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
       if (conn.closing) return;
       conn.lastActive = Date.now();
       parser.push(chunk);
-      if (!conn.waitingForDrain) pump(conn, parser);
+      if (conn.waitingForDrain) bufferWhileBlocked(conn, parser);
+      else pump(conn, parser);
     });
     socket.on('drain', () => {
       if (!conn.waitingForDrain || conn.closing) return;
       conn.waitingForDrain = false;
-      socket.resume();
-      pump(conn, parser); // run what was already received
+      pump(conn, parser); // run what was received meanwhile
     });
     socket.on('close', () => {
       unwatch(conn);

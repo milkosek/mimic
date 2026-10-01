@@ -87,6 +87,23 @@ Redis compatibility (each case checked against `redis-server`):
 - Glob patterns follow `stringmatchlen()`, quirks included: an unterminated `[` is a class to the end of the pattern, `[]` matches nothing, and reversed ranges are swapped. A seeded fuzz compares random patterns with Redis' `KEYS`.
 - The pre-AUTH limit checks follow Redis' order, and the multibulk limit is `INT_MAX` as in Redis; `--max-query-buffer` bounds memory.
 
+Hard edge cases from the next review round, fixed where the fix was simpler than the problem:
+
+- **A client that writes a whole pipeline before reading (redis-py, Jedis and other synchronous clients) could deadlock with the server.** MIMIC used to stop reading from a client whose replies were backing up. It now keeps reading and only stops *running* its commands, as Redis does, and a client that never reads is disconnected once its input passes `--max-query-buffer`, without a reply (like Redis).
+- **Filling the V8 heap aborted the process, losing the whole cache.** There is now a memory guard that behaves like Redis' `maxmemory` with `noeviction`: above `--max-memory-percent` (default 80%) of the heap limit, commands that grow memory get `-OOM command not allowed when used memory > 'maxmemory'.`, and inside `MULTI` every queued command does, as in Redis 7.0. Reads, deletes and flushes keep working, and writes resume once memory is freed. The README explains how to size the heap with `--max-old-space-size`.
+- **HTTP silently corrupted integers above 2^53** (JSON parsing rounds them). A request containing such a number is now refused with a 400 that says to send it as a string.
+- **`LTRIM` rebuilt the whole list,** so the "read a batch, trim it off" queue pattern was O(n) per batch. It now costs O(removed elements), like Redis.
+- **`APPEND` copied the whole value every time,** so building a value with many appends was quadratic. Values that grow past 4 KB through `APPEND` now use a growable buffer, and `GETRANGE`/`STRLEN` read it without copying.
+- Smaller Redis differences, now matching byte for byte:
+  - RESP lengths with leading zeros or `-0` (`*01`, `$04`, `*-0`) are protocol errors, as in Redis.
+  - Inline commands treat `\v` and `\f` like Redis' `sdssplitargs`: they don't separate arguments, except after a closing quote.
+  - In RESP3, `INFO`, `CLIENT INFO` and `CLIENT LIST` are verbatim strings (`=…txt:`). `CLIENT INFO` has the Redis 7 fields (`flags`, `sub`, `psub`, `multi`, `user`, `redir`, `resp`, and `cmd=client|info`).
+  - `CLIENT SETNAME a b` and other `CLIENT` subcommands with the wrong argument count give the `'client|setname'` arity error.
+  - `SELECT`, `MOVE` and `SWAPDB` reject indexes outside 32 bits with Redis' messages.
+  - `CONFIG GET` echoes an exact parameter name as given (`CONFIG GET DATABASES`); patterns return canonical names.
+  - The HTTP `Host` check accepted any name containing `:`; it now only skips IPv6 literals.
+- Left as documented differences: expire times beyond 2^53 ms are capped, and multi-million-key heaps see occasional V8 pauses of a few hundred ms.
+
 ## 0.1.0
 
 - First draft: an HTTP/JSON API, a singleton store, and lazy plus active TTL expiry.

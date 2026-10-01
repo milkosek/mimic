@@ -8,7 +8,9 @@ export type { Entry, EntryType, KeyspaceListener, SetOptions, SetResult, ExpireO
 export { Keyspace } from './keyspace.js';
 export { COMMANDS, execute } from './commands.js';
 export type { CommandContext, CommandSpec, ConnectionHandle, InfoSections } from './commands.js';
-export { OK, PONG, ReplyError, SimpleString, WrongTypeError } from './reply.js';
+export { MapReply, NULL_ARRAY, NullArray, OK, PONG, ReplyError, SimpleString, VerbatimString, WrongTypeError } from './reply.js';
+export { MemoryGuard, OOM_MESSAGE } from './memory.js';
+export type { MemoryGuardSource } from './memory.js';
 export type { Reply } from './reply.js';
 export { createRespServer } from './resp/server.js';
 export type { Logger, RespServer, RespServerOptions } from './resp/server.js';

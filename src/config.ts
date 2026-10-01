@@ -31,6 +31,8 @@ export interface MimicConfig {
   cleanupIntervalMs: number;
   cleanupSampleSize: number;
   cleanupTimeBudgetMs: number;
+  /** Refuse memory-growing writes (-OOM) above this % of the V8 heap limit; 0 = off. */
+  maxMemoryPercent: number;
   logLevel: LogLevel;
 }
 
@@ -62,6 +64,7 @@ export const OPTIONS: OptionDef[] = [
   { key: 'cleanupIntervalMs', flag: 'cleanup-interval', env: 'MIMIC_CLEANUP_INTERVAL_MS', kind: 'int', help: 'active expiry interval in ms (default 100)' },
   { key: 'cleanupSampleSize', flag: 'cleanup-sample-size', env: 'MIMIC_CLEANUP_SAMPLE_SIZE', kind: 'int', help: 'keys checked per expiry batch (default 20)' },
   { key: 'cleanupTimeBudgetMs', flag: 'cleanup-time-budget', env: 'MIMIC_CLEANUP_TIME_BUDGET_MS', kind: 'int', help: 'max ms per expiry cycle (default 5)' },
+  { key: 'maxMemoryPercent', flag: 'max-memory-percent', env: 'MIMIC_MAX_MEMORY_PERCENT', kind: 'int', help: 'refuse growing writes with -OOM above this % of the V8 heap limit, 0 = off (default 80)' },
   { key: 'logLevel', flag: 'log-level', env: 'MIMIC_LOG_LEVEL', kind: 'level', help: 'silent|error|warn|info|debug (default info)' },
 ];
 
@@ -192,6 +195,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2), env: NodeJS.P
     cleanupIntervalMs: Math.max((values['cleanupIntervalMs'] as number | undefined) ?? 100, 1),
     cleanupSampleSize: Math.max((values['cleanupSampleSize'] as number | undefined) ?? 20, 1),
     cleanupTimeBudgetMs: (values['cleanupTimeBudgetMs'] as number | undefined) ?? 5,
+    maxMemoryPercent: Math.min((values['maxMemoryPercent'] as number | undefined) ?? 80, 100),
     logLevel: (values['logLevel'] as LogLevel | undefined) ?? 'info',
   };
   if (config.databases < 1) throw new ConfigError('databases must be at least 1');

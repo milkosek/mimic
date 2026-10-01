@@ -27,9 +27,10 @@
 //     or an allow-listed name, which defeats DNS rebinding.
 
 import http from 'node:http';
+import { isIPv6 } from 'node:net';
 import { fromText, toText } from '../bytes.js';
 import { execute, type InfoSections } from '../commands.js';
-import { MapReply, NullArray, ReplyError, SimpleString, type Reply } from '../reply.js';
+import { MapReply, NullArray, ReplyError, SimpleString, VerbatimString, type Reply } from '../reply.js';
 import type { Logger } from '../resp/server.js';
 import type { Database, Store } from '../store.js';
 import { safeEqual } from '../util.js';
@@ -100,14 +101,47 @@ function readJson(req: http.IncomingMessage, limit: number): Promise<unknown> {
     req.on('end', () => {
       if (size > limit) return;
       if (size === 0) return resolve(undefined);
+      let parsed: unknown;
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       } catch {
         reject(new HttpError(400, 'invalid JSON body'));
+        return;
       }
+      const unsafe = findUnsafeInteger(parsed);
+      if (unsafe !== undefined) {
+        reject(
+          new HttpError(
+            400,
+            `the number ${unsafe} is too large to be read exactly from JSON (above 2^53); send it as a string, e.g. "${unsafe}" (Db2: VARCHAR instead of BIGINT)`,
+          ),
+        );
+        return;
+      }
+      resolve(parsed);
     });
     req.on('error', reject);
   });
+}
+
+/**
+ * JSON.parse silently rounds integers beyond 2^53 (1234567890123456789 ->
+ * 1234567890123456800), so such a number can't be stored as sent. Find one
+ * anywhere in the body, so the request can be refused instead of corrupting
+ * the value. (The original digits are gone by now; the message shows the
+ * rounded value.)
+ */
+function findUnsafeInteger(root: unknown): number | undefined {
+  const stack: unknown[] = [root]; // iterative: any nesting depth
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (typeof v === 'number') {
+      if (Number.isInteger(v) && !Number.isSafeInteger(v)) return v;
+    } else if (v !== null && typeof v === 'object') {
+      for (const item of Array.isArray(v) ? v : Object.values(v)) stack.push(item);
+    }
+  }
+  return undefined;
 }
 
 /** JSON value -> command argument (binary string). */
@@ -125,6 +159,7 @@ function toJson(r: Reply): Json {
   if (typeof r === 'bigint') return Number.isSafeInteger(Number(r)) ? Number(r) : r; // stays a JSON number
   if (r instanceof SimpleString) return r.value;
   if (r instanceof NullArray) return null;
+  if (r instanceof VerbatimString) return toText(r.value);
   if (r instanceof Error) return { error: r.message };
   if (r instanceof MapReply) return Object.fromEntries(r.entries.map(([k, v]) => [String(toJson(k)), toJson(v)]));
   return r.map(toJson);
@@ -178,7 +213,7 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
     }
     if (!opts.authToken) {
       const name = hostName(req.headers.host ?? '');
-      const ok = name === '' || name === 'localhost' || name.endsWith('.localhost') || IPV4.test(name) || name.includes(':') || allowedHosts.has(name);
+      const ok = name === '' || name === 'localhost' || name.endsWith('.localhost') || IPV4.test(name) || isIPv6(name) || allowedHosts.has(name);
       if (!ok) {
         throw new HttpError(403, `Host "${req.headers.host}" is not allowed without a password; set a password or add it to --http-allowed-hosts`);
       }
