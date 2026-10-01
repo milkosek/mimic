@@ -6,7 +6,7 @@ import { Store } from '../src/store.js';
 import { sleep } from './helpers.js';
 
 let store: Store;
-const run = (...argv: string[]) => execute({ store }, argv);
+const run = (...argv: string[]) => execute({ store, db: store }, argv);
 
 beforeEach(() => {
   store = Store.getInstance({ cleanupIntervalMs: 20 });
@@ -166,7 +166,55 @@ test('KEYS and SCAN skip expired keys; SCAN supports MATCH, COUNT and TYPE', asy
 });
 
 test('unknown commands and arity errors look like Redis', () => {
-  assert.throws(() => run('NOPE', 'a'), { message: "ERR unknown command 'NOPE', with args beginning with: 'a'" });
+  assert.throws(() => run('NOPE', 'a'), { message: "ERR unknown command 'NOPE', with args beginning with: 'a' " });
   assert.throws(() => run('GET'), { message: "ERR wrong number of arguments for 'get' command" });
   assert.throws(() => run('MSET', 'a', '1', 'b'), /wrong number of arguments for 'mset'/);
+});
+
+test('multiple databases: SELECT-style access, MOVE, SWAPDB, FLUSHDB vs FLUSHALL', () => {
+  assert.equal(store.databases, 16);
+  const db1 = store.db(1);
+  store.set('k', 'zero');
+  db1.set('k', 'one');
+  assert.equal(store.get('k'), 'zero');
+  assert.equal(db1.get('k'), 'one');
+  assert.throws(() => store.db(16), /DB index is out of range/);
+  store.set('m', 'v', { px: 100_000 });
+  assert.equal(store.move('m', 0, 2), 1);
+  assert.equal(store.exists(['m']), 0);
+  assert.ok(store.db(2).pttl('m') > 0, 'TTL travels with the key');
+  assert.equal(store.move('k', 0, 1), 0, 'target already has the key');
+  assert.throws(() => store.move('k', 0, 0), /source and destination objects are the same/);
+  store.swapdb(0, 1);
+  assert.equal(store.get('k'), 'one');
+  assert.equal(db1.get('k'), 'zero');
+  db1.flushdb();
+  assert.equal(db1.dbsize(), 0);
+  assert.equal(store.dbsize(), 1);
+  assert.deepEqual(Object.keys(store.info().keyspace).sort(), ['db0', 'db2']);
+  store.flushall();
+  assert.equal(store.info().keys, 0);
+});
+
+test('change notifications fire only on real modifications, per database', () => {
+  const events: string[] = [];
+  const off = store.onChange((key, db) => events.push(`${db}:${key}`));
+  store.set('a', '1');
+  store.set('a', '2', { nx: true }); // not written
+  store.expire('missing', 10); // no such key
+  store.del(['missing']);
+  store.db(3).hset('h', [['f', 'v']]);
+  store.db(3).hdel('h', ['nope']); // nothing removed
+  store.db(3).hset('h2', [['f', 'v']]);
+  const existed: boolean[] = [];
+  off();
+  const off2 = store.onChange((key, db, ex) => {
+    if (key === null) existed.push(ex!('h2'), ex!('never'));
+    else events.push(`${db}:${key}`);
+  });
+  store.db(3).flushdb();
+  off2();
+  store.set('after', 'x');
+  assert.deepEqual(events, ['0:a', '3:h', '3:h2']);
+  assert.deepEqual(existed, [true, false], 'FLUSHDB reports which keys existed');
 });

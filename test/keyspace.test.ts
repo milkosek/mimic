@@ -103,3 +103,23 @@ test('random churn never loses a stable key', () => {
     for (const k of stable) assert.ok(seen.has(k), `round ${round}: missing ${k}`);
   }
 });
+
+test('growth is incremental: rehashing spreads over later writes', () => {
+  const ks = new Keyspace<number>();
+  let i = 0;
+  while (!ks.isRehashing) ks.set(`k${i++}`, 0);
+  const startedAt = i;
+  while (ks.isRehashing) ks.set(`k${i++}`, 0);
+  assert.ok(i - startedAt > 1, 'rehash should take several writes, not one');
+  for (let j = 0; j < i; j++) assert.equal(ks.get(`k${j}`), 0);
+  const seen = new Set(fullScan(ks, 10));
+  assert.equal(seen.size, i);
+});
+
+test('rehashFor() finishes a rehash from the timer', () => {
+  const ks = new Keyspace<number>();
+  let i = 0;
+  while (!ks.isRehashing) ks.set(`k${i++}`, 0);
+  ks.rehashFor(50);
+  assert.equal(ks.isRehashing, false);
+});

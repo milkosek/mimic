@@ -125,8 +125,8 @@ test('WATCH aborts EXEC when another client modifies the key', async () => {
   await waitFor(/^\+OK\r\n$/);
   await rawExchange(d.respPort, cmd('SET', 'balance', '100'), (s) => s.includes('\r\n')); // other client
   a.write(Buffer.concat([cmd('MULTI'), cmd('SET', 'balance', '0'), cmd('EXEC')]));
-  await waitFor(/\$-1\r\n$/);
-  assert.equal(data, '+OK\r\n+OK\r\n+QUEUED\r\n$-1\r\n');
+  await waitFor(/\*-1\r\n$/);
+  assert.equal(data, '+OK\r\n+OK\r\n+QUEUED\r\n*-1\r\n');
   // Without interference the transaction goes through.
   data = '';
   a.write(Buffer.concat([cmd('WATCH', 'balance'), cmd('MULTI'), cmd('SET', 'balance', '0'), cmd('EXEC')]));

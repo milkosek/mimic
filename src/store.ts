@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The in-memory data store (a process-wide singleton).
+// The in-memory data store.
+//
+// `Store` is the process-wide singleton. Like Redis it holds several numbered
+// databases (16 by default, see SELECT); each one is a `Database` with its
+// own keys and TTLs. The Store itself *is* database 0, so code that embeds
+// MIMIC can simply call store.set()/store.get().
 //
 // Expiration works the way Redis does it, with two complementary mechanisms:
 //   1. Lazy (passive): every access checks the key's deadline and deletes it
@@ -15,7 +20,7 @@ import { performance } from 'node:perf_hooks';
 import { Deque } from './deque.js';
 import { Keyspace } from './keyspace.js';
 import { ReplyError, WrongTypeError } from './reply.js';
-import { checkInt64, globToRegExp, normaliseRange, toInt64 } from './util.js';
+import { checkInt64, globMatch, normaliseRange, toInt, toInt64 } from './util.js';
 
 export type Entry =
   | { type: 'string'; value: string }
@@ -34,6 +39,8 @@ export interface StoreOptions {
   repeatThreshold?: number;
   /** Hard cap on time spent per cycle, keeps the event loop responsive. */
   timeBudgetMs?: number;
+  /** Number of databases (Redis: databases 16). */
+  databases?: number;
 }
 
 export interface SetOptions {
@@ -84,9 +91,12 @@ export interface StoreStats {
 
 export interface StoreInfo extends StoreStats {
   uptimeSec: number;
+  /** Totals over all databases. */
   keys: number;
   keysWithTtl: number;
   buckets: number;
+  /** Non-empty databases: { db0: { keys, expires }, ... } */
+  keyspace: Record<string, { keys: number; expires: number }>;
   hitRate: number;
   heapUsedBytes: number;
   config: Required<StoreOptions>;
@@ -97,9 +107,21 @@ const DEFAULTS: Required<StoreOptions> = Object.freeze({
   sampleSize: 20,
   repeatThreshold: 0.25,
   timeBudgetMs: 5,
+  databases: 16,
 });
 
-const invalidExpire = (cmd: string): ReplyError => new ReplyError(`invalid expire time in '${cmd}' command`);
+export const invalidExpire = (cmd: string): ReplyError => new ReplyError(`invalid expire time in '${cmd}' command`);
+
+const safeDeadline = (ms: number, cmd: string): number => {
+  if (!Number.isSafeInteger(ms)) throw invalidExpire(cmd);
+  return ms;
+};
+
+/** Redis' rules for combining EXPIRE's NX / XX / GT / LT flags (same order, same messages). */
+export function checkExpireFlags(o: ExpireOptions): void {
+  if (o.nx && (o.xx || o.gt || o.lt)) throw new ReplyError('NX and XX, GT or LT options at the same time are not compatible');
+  if (o.gt && o.lt) throw new ReplyError('GT and LT options at the same time are not compatible');
+}
 
 function positive(n: number | undefined, cmd: string): number | undefined {
   if (n === undefined) return undefined;
@@ -111,95 +133,96 @@ function positive(n: number | undefined, cmd: string): number | undefined {
 function deadlineFrom(o: { ex?: number; px?: number; exat?: number; pxat?: number }, cmd: string): number | undefined {
   const given = [o.ex, o.px, o.exat, o.pxat].filter((v) => v !== undefined).length;
   if (given > 1) throw new ReplyError('syntax error');
-  const now = Date.now();
-  if (o.ex !== undefined) return now + positive(o.ex, cmd)! * 1000;
-  if (o.px !== undefined) return now + positive(o.px, cmd)!;
-  if (o.exat !== undefined) return positive(o.exat, cmd)! * 1000;
-  if (o.pxat !== undefined) return positive(o.pxat, cmd)!;
-  return undefined;
+  let deadline: number | undefined;
+  if (o.ex !== undefined) deadline = Date.now() + positive(o.ex, cmd)! * 1000;
+  else if (o.px !== undefined) deadline = Date.now() + positive(o.px, cmd)!;
+  else if (o.exat !== undefined) deadline = positive(o.exat, cmd)! * 1000;
+  else if (o.pxat !== undefined) deadline = positive(o.pxat, cmd)!;
+  if (deadline !== undefined && !Number.isSafeInteger(deadline)) throw invalidExpire(cmd);
+  return deadline;
 }
 
-export class Store {
-  static #instance: Store | null = null;
-  static #constructing = false;
+/**
+ * Called after a key really changed (written, deleted, expired, TTL changed).
+ * This is Redis' signalModifiedKey(): it is what WATCH relies on, whichever
+ * front door (RESP, HTTP, embedding) made the change.
+ *
+ * For FLUSHDB / FLUSHALL / SWAPDB, `key` is null and `existed(k)` tells
+ * whether k was present in the affected database(s) - as in Redis'
+ * touchAllWatchedKeysInDb(), only keys that existed count as modified.
+ */
+export type KeyspaceListener = (key: string | null, db: number, existed?: (key: string) => boolean) => void;
 
-  readonly #data = new Keyspace<Entry>();
-  readonly #expires = new Map<string, number>(); // key -> absolute deadline (ms since epoch)
-  readonly #opts: Required<StoreOptions>;
-  readonly #startedAt = Date.now();
-  readonly #stats: StoreStats = {
-    hits: 0,
-    misses: 0,
-    expiredLazy: 0,
-    expiredActive: 0,
-    cycles: 0,
-    lastCycleMs: 0,
-  };
-  #timer: NodeJS.Timeout | null = null;
+/** State shared by all databases of one Store. */
+interface Shared {
+  readonly opts: Required<StoreOptions>;
+  readonly stats: StoreStats;
+  readonly listeners: Set<KeyspaceListener>;
+  readonly startedAt: number;
+}
+
+/** One numbered database: keys, TTLs and every data command. */
+export class Database {
+  /** The database number (SELECT index). */
+  readonly index: number;
+  #data = new Keyspace<Entry>();
+  #expires = new Map<string, number>(); // key -> absolute deadline (ms since epoch)
   #cursor: IterableIterator<[string, number]> | null = null; // persisted between active cycles
+  readonly #shared: Shared;
 
-  /** @internal Use Store.getInstance(). */
-  constructor(opts: StoreOptions = {}) {
-    if (!Store.#constructing) throw new Error('Store is a singleton - use Store.getInstance()');
-    this.#opts = { ...DEFAULTS, ...opts };
+  /** @internal Databases are created by the Store. */
+  constructor(index: number, shared: Shared) {
+    this.index = index;
+    this.#shared = shared;
   }
 
-  /** The process-wide store. Options only apply on the first call. */
-  static getInstance(opts?: StoreOptions): Store {
-    if (!Store.#instance) {
-      Store.#constructing = true;
-      try {
-        Store.#instance = new Store(opts);
-      } finally {
-        Store.#constructing = false;
-      }
-    }
-    return Store.#instance;
+  get keyCount(): number {
+    return this.#data.size;
   }
 
-  /** Stop the timer and drop the singleton (tests, embedding). */
-  static resetInstance(): void {
-    Store.#instance?.stop();
-    Store.#instance = null;
+  get ttlCount(): number {
+    return this.#expires.size;
   }
 
-  // ------------------------------------------------------------------ lifecycle
-
-  /** Start the active expire cycle. */
-  start(): this {
-    if (!this.#timer) {
-      this.#timer = setInterval(() => this.activeExpireCycle(), this.#opts.cleanupIntervalMs);
-      this.#timer.unref(); // never keep the process alive on its own
-    }
-    return this;
-  }
-
-  stop(): this {
-    if (this.#timer) clearInterval(this.#timer);
-    this.#timer = null;
-    return this;
+  get bucketCount(): number {
+    return this.#data.bucketCount;
   }
 
   // ------------------------------------------------------------------ internals
 
+  #touch(key: string): void {
+    const listeners = this.#shared.listeners;
+    if (listeners.size === 0) return;
+    for (const listener of listeners) listener(key, this.index);
+  }
+
+  #touchAll(existed: (key: string) => boolean): void {
+    const listeners = this.#shared.listeners;
+    if (listeners.size === 0) return;
+    for (const listener of listeners) listener(null, this.index, existed);
+  }
+
   #remove(key: string): boolean {
     this.#expires.delete(key);
-    return this.#data.delete(key);
+    if (!this.#data.delete(key)) return false;
+    this.#touch(key);
+    return true;
   }
 
   /** Every read path goes through here: this is where lazy expiration happens. */
   #lookup(key: string, countStats = true): Entry | undefined {
+    const stats = this.#shared.stats;
     const entry = this.#data.get(key);
     if (entry !== undefined) {
       const deadline = this.#expires.get(key);
       if (deadline === undefined || deadline > Date.now()) {
-        if (countStats) this.#stats.hits++;
+        if (countStats) stats.hits++;
         return entry;
       }
       this.#remove(key);
-      this.#stats.expiredLazy++;
+      stats.expiredLazy++;
     }
-    if (countStats) this.#stats.misses++;
+    if (countStats) stats.misses++;
     return undefined;
   }
 
@@ -230,22 +253,21 @@ export class Store {
   }
 
   /**
-   * Active expiration, modelled on Redis' activeExpireCycle(): check
-   * `sampleSize` keys that carry a TTL, delete the expired ones and, if more
-   * than `repeatThreshold` of them had expired, assume there is more garbage
-   * and go again - never beyond `timeBudgetMs`. The iterator survives between
-   * runs so each cycle resumes where the previous one stopped.
+   * Active expiration for this database, modelled on Redis'
+   * activeExpireCycle(): check `sampleSize` keys that carry a TTL, delete the
+   * expired ones and, if more than `repeatThreshold` of them had expired,
+   * assume there is more garbage and go again - until `deadline`
+   * (performance.now() time). The iterator survives between runs so each
+   * cycle resumes where the previous one stopped.
+   * @internal Called by Store.activeExpireCycle().
    */
-  activeExpireCycle(): number {
-    const { sampleSize, repeatThreshold, timeBudgetMs } = this.#opts;
-    const started = performance.now();
+  expireCycle(deadline: number): number {
+    const { sampleSize, repeatThreshold } = this.#shared.opts;
     let reclaimed = 0;
-
     for (;;) {
       const now = Date.now();
       let checked = 0;
       let expired = 0;
-
       while (checked < sampleSize) {
         this.#cursor ??= this.#expires.entries();
         const next = this.#cursor.next();
@@ -253,23 +275,52 @@ export class Store {
           this.#cursor = null; // full pass done; the next batch restarts
           break;
         }
-        const [key, deadline] = next.value;
+        const [key, keyDeadline] = next.value;
         checked++;
-        if (deadline <= now) {
+        if (keyDeadline <= now) {
           this.#remove(key);
           expired++;
         }
       }
-
       reclaimed += expired;
       const dirty = checked > 0 && expired / checked > repeatThreshold;
-      if (!dirty || performance.now() - started >= timeBudgetMs) break;
+      if (!dirty || performance.now() >= deadline) break;
     }
-
-    this.#stats.cycles++;
-    this.#stats.expiredActive += reclaimed;
-    this.#stats.lastCycleMs = +(performance.now() - started).toFixed(3);
+    this.#shared.stats.expiredActive += reclaimed;
     return reclaimed;
+  }
+
+  /** @internal Incremental rehashing step, called from the Store's timer. */
+  rehashFor(ms: number): void {
+    this.#data.rehashFor(ms);
+  }
+
+  /** @internal Remove a key and hand back its entry and deadline (MOVE). */
+  takeEntry(key: string): { entry: Entry; deadline: number | undefined } | null {
+    const entry = this.#lookup(key, false);
+    if (!entry) return null;
+    const deadline = this.#expires.get(key);
+    this.#remove(key);
+    return { entry, deadline };
+  }
+
+  /** @internal Store an entry taken from another database (MOVE). */
+  putEntry(key: string, entry: Entry, deadline: number | undefined): void {
+    this.#data.set(key, entry);
+    if (deadline !== undefined) this.#expires.set(key, deadline);
+    this.#touch(key);
+  }
+
+  /** @internal Exchange all contents with another database (SWAPDB). */
+  swapWith(other: Database): void {
+    [this.#data, other.#data] = [other.#data, this.#data];
+    [this.#expires, other.#expires] = [other.#expires, this.#expires];
+    this.#cursor = null;
+    other.#cursor = null;
+    // A watched key counts as modified if it exists in either database.
+    const inEither = (k: string): boolean => this.#data.has(k) || other.#data.has(k);
+    this.#touchAll(inEither);
+    other.#touchAll(inEither);
   }
 
   // -------------------------------------------------------------------- strings
@@ -286,6 +337,7 @@ export class Store {
     if ((opts.nx && existing) || (opts.xx && !existing)) return { written: false, previous };
 
     this.#data.set(key, { type: 'string', value });
+    this.#touch(key);
     if (deadline !== undefined) this.#setDeadline(key, deadline);
     else if (!opts.keepttl) this.#expires.delete(key);
     return { written: true, previous };
@@ -302,13 +354,17 @@ export class Store {
   }
 
   /** GET with a TTL side effect: EX/PX/EXAT/PXAT sets it, PERSIST clears it. */
-  getex(key: string, opts: GetExOptions = {}): string | null {
+  getex(key: string, opts: GetExOptions = {}, countStats = true): string | null {
     const deadline = deadlineFrom(opts, 'getex');
     if (deadline !== undefined && opts.persist) throw new ReplyError('syntax error');
-    const value = this.get(key);
+    const value = this.#typed(key, 'string', countStats)?.value ?? null;
     if (value === null) return null;
-    if (deadline !== undefined) this.#setDeadline(key, deadline);
-    else if (opts.persist) this.#expires.delete(key);
+    if (deadline !== undefined) {
+      this.#setDeadline(key, deadline);
+      this.#touch(key);
+    } else if (opts.persist && this.#expires.delete(key)) {
+      this.#touch(key);
+    }
     return value;
   }
 
@@ -335,11 +391,13 @@ export class Store {
     const next = checkInt64((entry ? toInt64(entry.value) : 0n) + by);
     if (entry) entry.value = next.toString(); // keeps the TTL, like Redis
     else this.#data.set(key, { type: 'string', value: next.toString() });
+    this.#touch(key);
     return next;
   }
 
   append(key: string, suffix: string): number {
     const entry = this.#typed(key, 'string', false);
+    this.#touch(key);
     if (entry) {
       entry.value += suffix;
       return entry.value.length;
@@ -352,11 +410,19 @@ export class Store {
     return this.#typed(key, 'string', false)?.value.length ?? 0;
   }
 
+  /** GETRANGE, with Redis' exact index rules (getrangeCommand in t_string.c). */
   getrange(key: string, start: number, end: number): string {
     const value = this.get(key);
-    if (value === null || value.length === 0) return '';
-    const [s, e] = normaliseRange(start, end, value.length);
-    return s > e ? '' : value.slice(s, e + 1);
+    if (value === null) return '';
+    const len = value.length;
+    if (start < 0 && end < 0 && start > end) return '';
+    let s = start < 0 ? len + start : start;
+    let e = end < 0 ? len + end : end;
+    if (s < 0) s = 0;
+    if (e < 0) e = 0; // unlike LRANGE, a too-negative end clamps to the first byte
+    if (e >= len) e = len - 1;
+    if (s > e || len === 0) return '';
+    return value.slice(s, e + 1);
   }
 
   // ----------------------------------------------------------------------- keys
@@ -377,10 +443,10 @@ export class Store {
 
   /** KEYS pattern: O(N) over the whole keyspace, prefer scan() in production. */
   keys(pattern = '*'): string[] {
-    const re = pattern === '*' ? null : globToRegExp(pattern);
+    const all = pattern === '*'; // like Redis: "*" skips matching (it would also skip the empty key)
     const out: string[] = [];
     for (const key of [...this.#data.keys()]) {
-      if (re && !re.test(key)) continue;
+      if (!all && !globMatch(pattern, key)) continue;
       if (this.#lookup(key, false)) out.push(key); // lazily drops expired keys
     }
     return out;
@@ -395,7 +461,7 @@ export class Store {
    */
   scan(cursor: number, opts: ScanOptions = {}): [cursor: number, keys: string[]] {
     const count = opts.count ?? 10;
-    const re = opts.match && opts.match !== '*' ? globToRegExp(opts.match) : null;
+    const pattern = opts.match !== undefined && opts.match !== '*' ? opts.match : null;
     const collected: string[] = [];
     let next = cursor;
     let budget = count * 10; // bound the work spent on sparse tables, like Redis
@@ -404,7 +470,7 @@ export class Store {
     } while (next !== 0 && budget-- > 0 && collected.length < count);
 
     const keys = collected.filter((k) => {
-      if (re && !re.test(k)) return false;
+      if (pattern !== null && !globMatch(pattern, k)) return false;
       const entry = this.#lookup(k, false);
       return entry !== undefined && (!opts.type || entry.type === opts.type);
     });
@@ -420,27 +486,27 @@ export class Store {
     this.#remove(dst);
     this.#data.set(dst, entry);
     if (deadline !== undefined) this.#expires.set(dst, deadline);
+    this.#touch(dst);
   }
 
   dbsize(): number {
     return this.#data.size; // like Redis, may include expired keys not yet reclaimed
   }
 
-  flushall(): void {
-    this.#data.clear();
-    this.#expires.clear();
+  /** FLUSHDB: delete every key of this database. */
+  flushdb(): void {
+    const old = this.#data;
+    this.#data = new Keyspace<Entry>();
+    this.#expires = new Map();
     this.#cursor = null;
+    this.#touchAll((k) => old.has(k));
   }
 
   // ------------------------------------------------------------------------ TTL
 
   /** Set an absolute deadline (ms). Returns 1 if the timeout was set, 0 otherwise. */
   pexpireat(key: string, deadlineMs: number, opts: ExpireOptions = {}): 0 | 1 {
-    const flags = [opts.nx, opts.xx, opts.gt, opts.lt].filter(Boolean).length;
-    if (flags > 1 && !(flags === 2 && opts.xx && (opts.gt || opts.lt))) {
-      throw new ReplyError('NX and XX, GT or LT options at the same time are not compatible');
-    }
-    if (opts.gt && opts.lt) throw new ReplyError('GT and LT options at the same time are not compatible');
+    checkExpireFlags(opts);
     if (!this.#lookup(key, false)) return 0;
     const current = this.#expires.get(key); // undefined = no TTL = "infinite"
     if (opts.nx && current !== undefined) return 0;
@@ -448,19 +514,20 @@ export class Store {
     if (opts.gt && (current === undefined || deadlineMs <= current)) return 0;
     if (opts.lt && current !== undefined && deadlineMs >= current) return 0;
     this.#setDeadline(key, deadlineMs);
+    this.#touch(key);
     return 1;
   }
 
   expire(key: string, seconds: number, opts?: ExpireOptions): 0 | 1 {
-    return this.pexpireat(key, Date.now() + seconds * 1000, opts);
+    return this.pexpireat(key, safeDeadline(Date.now() + seconds * 1000, 'expire'), opts);
   }
 
   pexpire(key: string, ms: number, opts?: ExpireOptions): 0 | 1 {
-    return this.pexpireat(key, Date.now() + ms, opts);
+    return this.pexpireat(key, safeDeadline(Date.now() + ms, 'pexpire'), opts);
   }
 
   expireat(key: string, unixSeconds: number, opts?: ExpireOptions): 0 | 1 {
-    return this.pexpireat(key, unixSeconds * 1000, opts);
+    return this.pexpireat(key, safeDeadline(unixSeconds * 1000, 'expireat'), opts);
   }
 
   /** Remaining TTL in ms: -2 = no such key, -1 = no TTL. */
@@ -484,7 +551,9 @@ export class Store {
 
   persist(key: string): 0 | 1 {
     if (!this.#lookup(key, false)) return 0;
-    return this.#expires.delete(key) ? 1 : 0;
+    if (!this.#expires.delete(key)) return 0;
+    this.#touch(key);
+    return 1;
   }
 
   // --------------------------------------------------------------------- hashes
@@ -496,6 +565,7 @@ export class Store {
       if (!hash.has(f)) added++;
       hash.set(f, v);
     }
+    this.#touch(key);
     return added;
   }
 
@@ -503,6 +573,7 @@ export class Store {
     const { value: hash } = this.#getOrCreate(key, 'hash', () => new Map());
     if (hash.has(field)) return 0;
     hash.set(field, value);
+    this.#touch(key);
     return 1;
   }
 
@@ -519,6 +590,7 @@ export class Store {
     const entry = this.#typed(key, 'hash', false);
     if (!entry) return 0;
     const n = fields.filter((f) => entry.value.delete(f)).length;
+    if (n > 0) this.#touch(key);
     this.#dropIfEmpty(key, entry);
     return n;
   }
@@ -550,6 +622,7 @@ export class Store {
     const current = hash.get(field);
     const next = checkInt64((current === undefined ? 0n : toInt64(current, () => new ReplyError('hash value is not an integer'))) + by);
     hash.set(field, next.toString());
+    this.#touch(key);
     return next;
   }
 
@@ -558,12 +631,14 @@ export class Store {
   lpush(key: string, values: string[]): number {
     const { value: list } = this.#getOrCreate(key, 'list', () => new Deque<string>());
     for (const v of values) list.unshift(v); // LPUSH k a b c -> [c, b, a]
+    this.#touch(key);
     return list.length;
   }
 
   rpush(key: string, values: string[]): number {
     const { value: list } = this.#getOrCreate(key, 'list', () => new Deque<string>());
     for (const v of values) list.push(v);
+    this.#touch(key);
     return list.length;
   }
 
@@ -574,6 +649,7 @@ export class Store {
     const n = Math.min(count ?? 1, list.length);
     const out: string[] = [];
     for (let i = 0; i < n; i++) out.push((left ? list.shift() : list.pop())!);
+    if (n > 0) this.#touch(key);
     this.#dropIfEmpty(key, entry);
     return count === undefined ? (out[0] ?? null) : out;
   }
@@ -593,8 +669,11 @@ export class Store {
     return s > e ? [] : entry.value.slice(s, e + 1);
   }
 
-  lindex(key: string, index: number): string | null {
-    return this.#typed(key, 'list')?.value.at(index) ?? null;
+  /** LINDEX. Like Redis, the key's type is checked before the index is parsed. */
+  lindex(key: string, index: number | string): string | null {
+    const list = this.#typed(key, 'list')?.value;
+    if (!list) return null;
+    return list.at(typeof index === 'string' ? toInt(index) : index) ?? null;
   }
 
   ltrim(key: string, start: number, stop: number): void {
@@ -602,6 +681,7 @@ export class Store {
     if (!entry) return;
     const [s, e] = normaliseRange(start, stop, entry.value.length);
     entry.value.keep(s, s > e ? s : e + 1);
+    this.#touch(key);
     this.#dropIfEmpty(key, entry);
   }
 
@@ -619,17 +699,172 @@ export class Store {
     return { type: entry.type, value, ttlMs: this.pttl(key) };
   }
 
+}
+
+/**
+ * The process-wide store: a singleton that owns all databases and the
+ * background timer. It is database 0 itself.
+ */
+export class Store extends Database {
+  static #instance: Store | null = null;
+  static #constructing = false;
+
+  readonly #dbs: Database[];
+  readonly #state: Shared;
+  #timer: NodeJS.Timeout | null = null;
+  #nextDb = 0; // round-robin start for the active expire cycle, like Redis
+
+  /** @internal Use Store.getInstance(). */
+  constructor(opts: StoreOptions = {}) {
+    if (!Store.#constructing) throw new Error('Store is a singleton - use Store.getInstance()');
+    const options: Required<StoreOptions> = { ...DEFAULTS, ...opts };
+    if (!Number.isInteger(options.databases) || options.databases < 1) throw new Error('databases must be a positive integer');
+    const shared: Shared = {
+      opts: options,
+      stats: { hits: 0, misses: 0, expiredLazy: 0, expiredActive: 0, cycles: 0, lastCycleMs: 0 },
+      listeners: new Set(),
+      startedAt: Date.now(),
+    };
+    super(0, shared);
+    this.#state = shared;
+    this.#dbs = [this];
+    for (let i = 1; i < options.databases; i++) this.#dbs.push(new Database(i, shared));
+  }
+
+  /** The process-wide store. Options only apply on the first call. */
+  static getInstance(opts?: StoreOptions): Store {
+    if (!Store.#instance) {
+      Store.#constructing = true;
+      try {
+        Store.#instance = new Store(opts);
+      } finally {
+        Store.#constructing = false;
+      }
+    }
+    return Store.#instance;
+  }
+
+  /** Stop the timer and drop the singleton (tests, embedding). */
+  static resetInstance(): void {
+    Store.#instance?.stop();
+    Store.#instance = null;
+  }
+
+  // ------------------------------------------------------------------ lifecycle
+
+  /** Start the active expire cycle (and incremental rehashing). */
+  start(): this {
+    if (!this.#timer) {
+      this.#timer = setInterval(() => {
+        this.activeExpireCycle();
+        for (const db of this.#dbs) db.rehashFor(1); // like Redis' serverCron
+      }, this.#state.opts.cleanupIntervalMs);
+      this.#timer.unref(); // never keep the process alive on its own
+    }
+    return this;
+  }
+
+  stop(): this {
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = null;
+    return this;
+  }
+
+  /** Whether the background timer (active expiry, rehashing) is running. */
+  get running(): boolean {
+    return this.#timer !== null;
+  }
+
+  /** Subscribe to key modifications in any database. Returns an unsubscribe function. */
+  onChange(listener: KeyspaceListener): () => void {
+    this.#state.listeners.add(listener);
+    return () => this.#state.listeners.delete(listener);
+  }
+
+  // ------------------------------------------------------------------ databases
+
+  get databases(): number {
+    return this.#dbs.length;
+  }
+
+  /** Database `index` (0-based, like SELECT). */
+  db(index: number): Database {
+    const db = this.#dbs[index];
+    if (!db) throw new ReplyError('DB index is out of range');
+    return db;
+  }
+
+  /** FLUSHALL: empty every database. */
+  flushall(): void {
+    for (const db of this.#dbs) db.flushdb();
+  }
+
+  /** MOVE key from one database to another. 1 if moved, 0 if missing in source or present in target. */
+  move(key: string, from: number, to: number): 0 | 1 {
+    const src = this.db(from);
+    const dst = this.db(to);
+    if (src === dst) throw new ReplyError('source and destination objects are the same');
+    if (dst.exists([key])) return 0;
+    const taken = src.takeEntry(key);
+    if (!taken) return 0;
+    dst.putEntry(key, taken.entry, taken.deadline);
+    return 1;
+  }
+
+  /** SWAPDB a b: exchange the contents of two databases. */
+  swapdb(a: number, b: number): void {
+    const x = this.db(a);
+    const y = this.db(b);
+    if (x !== y) x.swapWith(y);
+  }
+
+  /**
+   * Run active expiration over all databases within one shared time budget,
+   * starting from a different database each time so none starves.
+   */
+  activeExpireCycle(): number {
+    const { timeBudgetMs } = this.#state.opts;
+    const started = performance.now();
+    const deadline = started + timeBudgetMs;
+    let reclaimed = 0;
+    const n = this.#dbs.length;
+    for (let i = 0; i < n; i++) {
+      const db = this.#dbs[(this.#nextDb + i) % n]!;
+      if (db.ttlCount > 0) reclaimed += db.expireCycle(deadline);
+      if (performance.now() >= deadline) {
+        this.#nextDb = (this.#nextDb + i + 1) % n;
+        break;
+      }
+    }
+    const stats = this.#state.stats;
+    stats.cycles++;
+    stats.lastCycleMs = +(performance.now() - started).toFixed(3);
+    return reclaimed;
+  }
+
   info(): StoreInfo {
-    const { hits, misses } = this.#stats;
+    const stats = this.#state.stats;
+    const { hits, misses } = stats;
+    const keyspace: StoreInfo['keyspace'] = {};
+    let keys = 0;
+    let keysWithTtl = 0;
+    let buckets = 0;
+    for (const db of this.#dbs) {
+      keys += db.keyCount;
+      keysWithTtl += db.ttlCount;
+      buckets += db.bucketCount;
+      if (db.keyCount > 0) keyspace[`db${db.index}`] = { keys: db.keyCount, expires: db.ttlCount };
+    }
     return {
-      uptimeSec: Math.floor((Date.now() - this.#startedAt) / 1000),
-      keys: this.#data.size,
-      keysWithTtl: this.#expires.size,
-      buckets: this.#data.bucketCount,
-      ...this.#stats,
+      uptimeSec: Math.floor((Date.now() - this.#state.startedAt) / 1000),
+      keys,
+      keysWithTtl,
+      buckets,
+      keyspace,
+      ...stats,
       hitRate: hits + misses ? +(hits / (hits + misses)).toFixed(4) : 0,
       heapUsedBytes: process.memoryUsage().heapUsed,
-      config: { ...this.#opts },
+      config: { ...this.#state.opts },
     };
   }
 }

@@ -6,14 +6,21 @@
 //
 // Also owns per-connection state: AUTH, client name, protocol version and
 // transactions (MULTI/EXEC/DISCARD with optimistic WATCH).
+//
+// Hardening, as in Redis:
+//   * clients that have not authenticated get tiny parser limits
+//     (10 arguments, 16 KB per argument);
+//   * each client's unparsed input is capped (client-query-buffer-limit);
+//   * a "POST" or "Host:" line (an HTTP request sent to this port, e.g. by a
+//     web page) drops the connection before anything else runs.
 
 import net from 'node:net';
-import { commandKeys, NO_AUTH_COMMANDS, resolveCommand, type CommandSpec, type ConnectionHandle, type InfoSections } from '../commands.js';
-import { OK, ReplyError, SimpleString, type Reply } from '../reply.js';
+import { NO_AUTH_COMMANDS, resolveCommand, type CommandSpec, type ConnectionHandle, type InfoSections } from '../commands.js';
+import { NULL_ARRAY, OK, ReplyError, SimpleString, type Reply } from '../reply.js';
 import type { Store } from '../store.js';
 import { safeEqual } from '../util.js';
 import { encode, encodeError } from './encoder.js';
-import { DEFAULT_LIMITS, ProtocolError, RespParser, type ParserLimits } from './parser.js';
+import { DEFAULT_LIMITS, ProtocolError, RespParser, UNAUTHENTICATED_LIMITS, type ParserLimits } from './parser.js';
 
 export interface Logger {
   info(msg: string): void;
@@ -29,6 +36,10 @@ export interface RespServerOptions {
   /** Close connections idle for this many seconds (0 = never, the Redis default). */
   idleTimeoutSec?: number;
   limits?: Partial<ParserLimits>;
+  /** Max unparsed input buffered per client (Redis: client-query-buffer-limit, 1 GB). */
+  maxQueryBufferBytes?: number;
+  /** @internal A closing connection is destroyed after this long without progress (default 5 s). */
+  closeGraceMs?: number;
   logger?: Logger;
   /** Extra INFO sections (e.g. HTTP port) contributed by the daemon. */
   extraInfo?: () => InfoSections;
@@ -38,6 +49,48 @@ export interface RespServer extends net.Server {
   readonly stats: { connectedClients: number; totalConnections: number; totalCommands: number; rejectedConnections: number };
   /** Disconnect all clients (used on shutdown). */
   disconnectAll(): void;
+  /** Stop listening to store changes (done automatically on 'close'; call it if listen() failed). */
+  dispose(): void;
+}
+
+// Replies are written in pieces of about this size, so a big pipeline never
+// builds one giant string (V8 strings top out around 512 MB) and backpressure
+// can kick in between commands.
+const WRITE_CHUNK = 64 * 1024;
+// A closing connection is destroyed once its peer has read nothing for this long.
+const CLOSE_GRACE_MS = 5000;
+
+/** Bytes still waiting to be sent: Node's buffer and libuv's write queue. */
+function sendProgress(socket: net.Socket): [number, number] {
+  // writableLength stays at the full size of a large write until it completes;
+  // libuv's writeQueueSize (internal but long-stable) shrinks as the kernel
+  // accepts data, so it shows a slow reader is still reading.
+  const handle = (socket as unknown as { _handle?: { writeQueueSize?: number } })._handle;
+  return [socket.writableLength, handle?.writeQueueSize ?? 0];
+}
+
+/**
+ * End the socket after `out`, then destroy it when everything has been sent.
+ * If the peer stops reading (or never closes its side), give up once nothing
+ * has moved for a whole grace period - but never while a slow reader is still
+ * receiving a large final reply.
+ */
+function endAndRelease(socket: net.Socket, out: string, graceMs = CLOSE_GRACE_MS): void {
+  socket.end(out, 'latin1', () => socket.destroy());
+  let last = sendProgress(socket);
+  let lastProgress = Date.now();
+  const timer = setInterval(() => {
+    if (socket.destroyed) return clearInterval(timer);
+    const now = sendProgress(socket);
+    if (now[0] < last[0] || now[1] < last[1]) lastProgress = Date.now();
+    last = now;
+    if (Date.now() - lastProgress >= graceMs) {
+      clearInterval(timer);
+      socket.destroy();
+    }
+  }, Math.max(50, Math.floor(graceMs / 4)));
+  timer.unref();
+  socket.once('close', () => clearInterval(timer));
 }
 
 const QUEUED = new SimpleString('QUEUED');
@@ -51,10 +104,13 @@ class Connection implements ConnectionHandle {
   libName = '';
   libVer = '';
   authenticated: boolean;
+  db = 0;
   protocol: 2 | 3 = 2;
   closing = false;
+  waitingForDrain = false; // output is backed up: stop running commands until 'drain'
   // transaction state
   multi: string[][] | null = null;
+  multiBytes = 0; // size of the queued commands (counts against the query buffer limit)
   multiError = false;
   dirty = false; // a WATCHed key was modified
   readonly watching = new Set<string>();
@@ -70,8 +126,11 @@ class Connection implements ConnectionHandle {
 
   authenticate(username: string | null, password: string): 'ok' | 'wrongpass' | 'nopass' {
     const expected = this.server.password;
-    if (!expected) return username === null ? 'nopass' : 'ok';
-    const userOk = username === null || username === 'default';
+    const userOk = username === null || username === 'default'; // the only user, as in Redis without ACLs
+    if (!expected) {
+      if (username === null) return 'nopass';
+      return userOk ? 'ok' : 'wrongpass';
+    }
     if (userOk && safeEqual(password, expected)) {
       this.authenticated = true;
       return 'ok';
@@ -81,6 +140,7 @@ class Connection implements ConnectionHandle {
 
   reset(): void {
     this.name = '';
+    this.db = 0;
     this.protocol = 2;
     this.authenticated = !this.server.password;
   }
@@ -99,7 +159,7 @@ class Connection implements ConnectionHandle {
       `name=${this.name}`,
       `age=${Math.floor((now - this.createdAt) / 1000)}`,
       `idle=${Math.floor((now - this.lastActive) / 1000)}`,
-      `db=0`,
+      `db=${this.db}`,
       `cmd=${this.lastCommand.toLowerCase()}`,
       `lib-name=${this.libName}`,
       `lib-ver=${this.libVer}`,
@@ -142,14 +202,33 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     };
   };
 
-  // ---- WATCH bookkeeping: key -> connections watching it
+  // ---- WATCH bookkeeping: (db, key) -> connections watching it. The store
+  // reports every real modification (from RESP, HTTP, expiry or embedding code).
   const watchers = new Map<string, Set<Connection>>();
+  const watchKey = (db: number, key: string): string => `${db}\u0000${key}`; // db digits never contain NUL
+  const unsubscribe = store.onChange((key, db, existed) => {
+    if (watchers.size === 0) return;
+    if (key === null) {
+      // FLUSHDB / FLUSHALL / SWAPDB: only watched keys that existed are modified.
+      const prefix = `${db}\u0000`;
+      for (const [k, set] of watchers) {
+        if (k.startsWith(prefix) && existed?.(k.slice(prefix.length))) for (const c of set) c.dirty = true;
+      }
+    } else {
+      for (const c of watchers.get(watchKey(db, key)) ?? []) c.dirty = true;
+    }
+  });
 
-  const touch = (keys: string[]): void => {
-    for (const k of keys) for (const c of watchers.get(k) ?? []) c.dirty = true;
-  };
-  const touchAll = (): void => {
-    for (const set of watchers.values()) for (const c of set) c.dirty = true;
+  const watch = (conn: Connection, keys: string[]): void => {
+    // Drop keys that are already expired first, so they don't count as "modified" later.
+    store.db(conn.db).exists(keys);
+    for (const key of keys) {
+      const wk = watchKey(conn.db, key);
+      conn.watching.add(wk);
+      let set = watchers.get(wk);
+      if (!set) watchers.set(wk, (set = new Set()));
+      set.add(conn);
+    }
   };
   const unwatch = (conn: Connection): void => {
     for (const k of conn.watching) {
@@ -162,34 +241,35 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
   };
   const discard = (conn: Connection): void => {
     conn.multi = null;
+    conn.multiBytes = 0;
     conn.multiError = false;
     unwatch(conn);
   };
 
   /** Run a resolved command; errors become error replies. */
   function dispatch(conn: Connection, argv: string[], spec: CommandSpec): Reply {
-    let reply: Reply;
     try {
-      reply = spec.run({ store, conn, serverInfo }, argv.slice(1));
+      return spec.run({ store, db: store.db(conn.db), conn, serverInfo }, argv.slice(1));
     } catch (err) {
       if (err instanceof ReplyError) return err;
       logger?.error(`[resp] command ${argv[0]} failed`, err);
       return new ReplyError('internal error');
     }
-    if (watchers.size > 0 && spec.flags.includes('write')) {
-      if (/^FLUSH(ALL|DB)$/i.test(argv[0]!)) touchAll();
-      else touch(commandKeys(spec, argv));
-    }
-    return reply;
   }
 
   function exec(conn: Connection): Reply {
+    // A watched key that expired since WATCH counts as modified (Redis >= 6.0.9):
+    // looking it up deletes it lazily, which marks this connection dirty.
+    for (const wk of conn.watching) {
+      const sep = wk.indexOf('\u0000');
+      store.db(Number(wk.slice(0, sep))).exists([wk.slice(sep + 1)]);
+    }
     const queued = conn.multi ?? [];
     const failed = conn.multiError;
     const aborted = conn.dirty;
     discard(conn);
     if (failed) return new ReplyError('Transaction discarded because of previous errors.', 'EXECABORT');
-    if (aborted) return null; // a watched key changed: the client retries
+    if (aborted) return NULL_ARRAY; // a watched key changed: the client retries
     // Node runs this loop without yielding, so the transaction is atomic.
     return queued.map((argv) => dispatch(conn, argv, resolveCommand(argv)));
   }
@@ -198,16 +278,24 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     const name = argv[0]!.toUpperCase();
     conn.lastCommand = name;
     stats.totalCommands++;
-    if (!conn.authenticated && !NO_AUTH_COMMANDS.has(name)) {
-      return new ReplyError('Authentication required.', 'NOAUTH');
-    }
 
+    // Same order as Redis' processCommand(): unknown command and arity errors
+    // come before the authentication check.
     let spec: CommandSpec;
     try {
       spec = resolveCommand(argv);
     } catch (err) {
+      if (conn.multi && name === 'EXEC') {
+        // A broken EXEC ends the transaction (Redis: execCommandAbort).
+        discard(conn);
+        return new ReplyError(`Transaction discarded because of: ${(err as ReplyError).message.replace(/^ERR /, '')}`, 'EXECABORT');
+      }
       if (conn.multi) conn.multiError = true;
       return err as ReplyError;
+    }
+    if (!conn.authenticated && !NO_AUTH_COMMANDS.has(name)) {
+      if (conn.multi) conn.multiError = true;
+      return new ReplyError('Authentication required.', 'NOAUTH');
     }
 
     if (conn.multi) {
@@ -227,6 +315,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
           return dispatch(conn, argv, spec);
         default:
           conn.multi.push(argv);
+          for (const a of argv) conn.multiBytes += a.length;
           return QUEUED;
       }
     }
@@ -240,12 +329,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
       case 'DISCARD':
         return new ReplyError('DISCARD without MULTI');
       case 'WATCH':
-        for (const key of argv.slice(1)) {
-          conn.watching.add(key);
-          let set = watchers.get(key);
-          if (!set) watchers.set(key, (set = new Set()));
-          set.add(conn);
-        }
+        watch(conn, argv.slice(1));
         return OK;
       case 'UNWATCH':
         unwatch(conn);
@@ -259,15 +343,109 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     return dispatch(conn, argv, spec);
   }
 
+  // Redis' securityWarningCommand(): these "commands" only ever come from an
+  // HTTP request that was sent to the RESP port (cross-protocol scripting).
+  const isHttpProbe = (argv: string[]): boolean => {
+    const first = argv[0]!.toLowerCase();
+    return first === 'post' || first === 'host:';
+  };
+
+  const normalLimits: ParserLimits = { ...DEFAULT_LIMITS, ...opts.limits };
+  const limitsFor = (conn: Connection): ParserLimits => (conn.authenticated ? normalLimits : UNAUTHENTICATED_LIMITS);
+  const maxQueryBuffer = opts.maxQueryBufferBytes ?? 1024 * 1024 * 1024;
+
+  /** Close after flushing `out` (or at once, for silent drops). */
+  function finishClose(conn: Connection, out: string, silent: boolean): void {
+    if (silent) conn.socket.destroy();
+    else endAndRelease(conn.socket, out, opts.closeGraceMs);
+  }
+
+  /**
+   * Run every complete command the parser has, writing replies as we go. Stops
+   * early when the socket's buffer is full (resumed on 'drain'), when the
+   * connection is closing, or when more input is needed.
+   */
+  function pump(conn: Connection, parser: RespParser): void {
+    const socket = conn.socket;
+    let out = '';
+    let silent = false;
+    // Returns false when the kernel buffer is full: wait for 'drain'.
+    const flush = (): boolean => {
+      if (!out) return true;
+      const ok = socket.write(out, 'latin1');
+      out = '';
+      return ok;
+    };
+    try {
+      for (;;) {
+        parser.limits = limitsFor(conn); // AUTH / RESET change the limits for the next command
+        if (conn.closing) break;
+        const argv = parser.next();
+        if (argv === undefined) break;
+        if (isHttpProbe(argv)) {
+          logger?.warn(
+            `[resp] possible security attack: ${socket.remoteAddress} sent an HTTP request ("${argv[0]}") to the RESP port - connection aborted`,
+          );
+          conn.closing = true;
+          silent = true; // like Redis: no reply, just drop it
+          break;
+        }
+        let reply: string;
+        try {
+          reply = encode(run(conn, argv), conn.protocol);
+        } catch (err) {
+          if (!(err instanceof RangeError)) throw err;
+          reply = encodeError(new ReplyError('reply is too large to send')); // > V8's maximum string length
+        }
+        if (out.length + reply.length > WRITE_CHUNK && !flush()) {
+          out = reply;
+          conn.waitingForDrain = true;
+          socket.pause(); // backpressure: don't read or run more until the client drains replies
+          break;
+        }
+        out += reply;
+      }
+      const held = parser.buffered + conn.multiBytes;
+      if (!conn.closing && held > maxQueryBuffer) {
+        logger?.warn(`[resp] closing client ${conn.id}: query buffer of ${held} bytes exceeds the limit`);
+        out += encodeError(new ReplyError('Protocol error: client query buffer exceeds limit'));
+        conn.closing = true;
+      }
+    } catch (err) {
+      // Protocol error: report it and drop the connection, like Redis. Replies
+      // to the valid commands before the bad frame are kept.
+      if (err instanceof ProtocolError) {
+        out += encodeError(new ReplyError(err.message));
+      } else {
+        logger?.error(`[resp] unexpected error on client ${conn.id}`, err);
+        out += encodeError(new ReplyError('internal error'));
+      }
+      conn.closing = true;
+    }
+
+    if (conn.closing) {
+      conn.waitingForDrain = false;
+      finishClose(conn, out, silent);
+    } else if (!flush()) {
+      conn.waitingForDrain = true;
+      socket.pause();
+    }
+  }
+
   const server = net.createServer((socket) => {
+    // Always first: an unhandled 'error' (e.g. ECONNRESET) would crash the process.
+    socket.on('error', () => {
+      /* the 'close' handler cleans up */
+    });
+
     if (clients.size >= maxClients) {
       stats.rejectedConnections++;
-      socket.end('-ERR max number of clients reached\r\n');
+      endAndRelease(socket, '-ERR max number of clients reached\r\n', opts.closeGraceMs);
       return;
     }
 
     const conn = new Connection(++nextId, socket, shared);
-    const parser = new RespParser(opts.limits);
+    const parser = new RespParser(limitsFor(conn));
     clients.set(conn.id, conn);
     stats.totalConnections++;
     stats.connectedClients = clients.size;
@@ -281,40 +459,14 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     socket.on('data', (chunk: Buffer) => {
       if (conn.closing) return;
       conn.lastActive = Date.now();
-
-      let commands: string[][];
-      let protocolError: Error | undefined;
-      try {
-        commands = parser.push(chunk);
-      } catch (err) {
-        if (!(err instanceof ProtocolError)) throw err;
-        commands = [];
-        protocolError = err;
-      }
-
-      // Pipelined commands in one chunk produce one write.
-      let out = '';
-      for (const argv of commands) {
-        out += encode(run(conn, argv), conn.protocol);
-        if (conn.closing) break;
-      }
-
-      if (protocolError) {
-        // Like Redis: report the protocol error and drop the connection.
-        out += encodeError(new ReplyError(protocolError.message));
-        conn.closing = true;
-      }
-
-      if (conn.closing) {
-        socket.end(out, 'latin1');
-      } else if (out && !socket.write(out, 'latin1')) {
-        socket.pause(); // backpressure: stop reading until the client drains replies
-      }
+      parser.push(chunk);
+      if (!conn.waitingForDrain) pump(conn, parser);
     });
-
-    socket.on('drain', () => socket.resume());
-    socket.on('error', () => {
-      /* ECONNRESET and friends: the 'close' handler cleans up */
+    socket.on('drain', () => {
+      if (!conn.waitingForDrain || conn.closing) return;
+      conn.waitingForDrain = false;
+      socket.resume();
+      pump(conn, parser); // run what was already received
     });
     socket.on('close', () => {
       unwatch(conn);
@@ -323,6 +475,10 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     });
   }) as RespServer;
 
+  server.on('close', unsubscribe);
+  server.dispose = () => {
+    unsubscribe();
+  };
   Object.defineProperty(server, 'stats', { get: () => ({ ...stats, connectedClients: clients.size }) });
   server.disconnectAll = () => {
     for (const c of clients.values()) c.socket.destroy();

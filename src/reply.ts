@@ -22,6 +22,14 @@ export class SimpleString {
 }
 
 export const OK = new SimpleString('OK');
+
+/** A null *array* (RESP2 `*-1`, RESP3 `_`): EXEC aborted by WATCH, LPOP key count on a missing key. */
+export class NullArray {
+  toJSON(): null {
+    return null;
+  }
+}
+export const NULL_ARRAY = new NullArray();
 export const PONG = new SimpleString('PONG');
 
 /** Key/value pairs: a RESP3 map, or a flat [k1, v1, k2, v2, ...] array in RESP2. */
@@ -29,7 +37,11 @@ export class MapReply {
   constructor(readonly entries: [Reply, Reply][]) {}
 }
 
-export type Reply = string | number | bigint | null | SimpleString | ReplyError | MapReply | Reply[];
+export type Reply = string | number | bigint | null | NullArray | SimpleString | ReplyError | MapReply | Reply[];
+
+// Error codes that may already start a message. Anything else gets "ERR "
+// (e.g. "GT and LT options ..." or "MULTI calls can not be nested" are ERR errors).
+const KNOWN_CODES = /^(ERR|WRONGTYPE|NOAUTH|WRONGPASS|NOPROTO|EXECABORT|NOPERM|NOSCRIPT|BUSY|LOADING|READONLY|OOM) /;
 
 /**
  * An error sent back to the client. The message starts with an upper-case
@@ -38,7 +50,7 @@ export type Reply = string | number | bigint | null | SimpleString | ReplyError 
 export class ReplyError extends Error {
   readonly code: string;
   constructor(message: string, code?: string) {
-    const prefix = code ?? (/^[A-Z]+ /.test(message) ? '' : 'ERR');
+    const prefix = code ?? (KNOWN_CODES.test(message) ? '' : 'ERR');
     super(prefix ? `${prefix} ${message}` : message);
     this.code = this.message.split(' ', 1)[0]!;
     this.name = 'ReplyError';

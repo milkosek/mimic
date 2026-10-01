@@ -5,7 +5,7 @@
 //
 // A connection speaks RESP2 until it sends `HELLO 3`.
 
-import { MapReply, ReplyError, SimpleString, type Reply } from '../reply.js';
+import { MapReply, NullArray, ReplyError, SimpleString, type Reply } from '../reply.js';
 
 export type Protocol = 2 | 3;
 
@@ -28,6 +28,7 @@ export function encode(reply: Reply | undefined, proto: Protocol = 2): string {
       break;
   }
   if (reply instanceof SimpleString) return `+${oneLine(reply.value)}\r\n`;
+  if (reply instanceof NullArray) return proto === 3 ? '_\r\n' : '*-1\r\n';
   if (reply instanceof Error) return encodeError(reply);
   if (reply instanceof MapReply) {
     let out = proto === 3 ? `%${reply.entries.length}\r\n` : `*${reply.entries.length * 2}\r\n`;

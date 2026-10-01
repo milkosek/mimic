@@ -4,9 +4,9 @@
 // (including the command name; negative = "at least"), which drives argument
 // validation and the COMMAND reply that clients may introspect.
 
-import { MapReply, OK, PONG, ReplyError, SimpleString, syntaxError, type Reply } from './reply.js';
-import type { ExpireOptions, GetExOptions, SetOptions, Store } from './store.js';
-import { globToRegExp, toInt, toInt64 } from './util.js';
+import { MapReply, NULL_ARRAY, OK, PONG, ReplyError, SimpleString, syntaxError, type Reply } from './reply.js';
+import { checkExpireFlags, invalidExpire, type Database, type ExpireOptions, type Store } from './store.js';
+import { globMatch, toInt, toInt64 } from './util.js';
 import { NAME, REDIS_COMPAT_VERSION, VERSION } from './version.js';
 
 /** What a transport (the RESP server) exposes about the current connection. */
@@ -16,11 +16,13 @@ export interface ConnectionHandle {
   libName: string;
   libVer: string;
   authenticated: boolean;
+  /** Selected database (SELECT). */
+  db: number;
   /** RESP protocol version spoken on this connection (HELLO switches it). */
   protocol: 2 | 3;
   /** 'nopass' when the server has no password configured. */
   authenticate(username: string | null, password: string): 'ok' | 'wrongpass' | 'nopass';
-  /** RESET: drop name and authentication state. */
+  /** RESET: drop name, authentication state, selected database and protocol. */
   reset(): void;
   /** Close the connection after the current reply has been written. */
   requestClose(): void;
@@ -33,7 +35,10 @@ export interface ConnectionHandle {
 export type InfoSections = Record<string, Record<string, string | number>>;
 
 export interface CommandContext {
+  /** The whole store (all databases): FLUSHALL, MOVE, SWAPDB, INFO. */
   store: Store;
+  /** The selected database: what data commands operate on. */
+  db: Database;
   /** Present for RESP connections; absent over HTTP. */
   conn?: ConnectionHandle;
   /** Extra INFO sections supplied by the server (clients, stats, ports). */
@@ -52,9 +57,12 @@ export interface CommandSpec {
 
 const int = (v: string): number => toInt(v);
 const bigint = (v: string): bigint => toInt64(v);
+// Redis' getPositiveLongFromObjectOrReply(): any failure, including a
+// non-number, reports "must be positive".
 const positiveInt = (v: string): number => {
-  const n = toInt(v);
-  if (n < 0) throw new ReplyError('value is out of range, must be positive');
+  const mustBePositive = (): ReplyError => new ReplyError('value is out of range, must be positive');
+  const n = toInt(v, mustBePositive);
+  if (n < 0) throw mustBePositive();
   return n;
 };
 
@@ -66,42 +74,85 @@ function pairs(cmd: string, args: string[], offset = 0): [string, string][] {
   return out;
 }
 
-// SET key value [NX|XX] [GET] [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]
-function parseSetOptions(tokens: string[]): SetOptions {
-  const o: SetOptions = {};
-  for (let i = 0; i < tokens.length; i++) {
-    const flag = tokens[i]!.toUpperCase();
-    const val = (): number => {
-      if (i + 1 >= tokens.length) throw syntaxError();
-      return int(tokens[++i]!);
-    };
-    if (flag === 'NX') o.nx = true;
-    else if (flag === 'XX') o.xx = true;
-    else if (flag === 'GET') o.get = true;
-    else if (flag === 'KEEPTTL') o.keepttl = true;
-    else if (flag === 'EX') o.ex = val();
-    else if (flag === 'PX') o.px = val();
-    else if (flag === 'EXAT') o.exat = val();
-    else if (flag === 'PXAT') o.pxat = val();
-    else throw syntaxError();
-  }
-  return o;
+// ---- expire times: exact int64 checks with Redis' error messages
+
+const LLONG_MAX = 2n ** 63n - 1n;
+const LLONG_MIN = -(2n ** 63n);
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE = BigInt(Number.MIN_SAFE_INTEGER);
+
+// Deadlines beyond 2^53 ms (~287,000 years) saturate; Redis would store them exactly.
+const toSafeMs = (ms: bigint): number => Number(ms > MAX_SAFE ? MAX_SAFE : ms < MIN_SAFE ? MIN_SAFE : ms);
+
+type ExpireKind = 'EX' | 'PX' | 'EXAT' | 'PXAT';
+interface ExpireArg {
+  kind: ExpireKind;
+  raw: string;
 }
 
-function parseGetExOptions(tokens: string[]): GetExOptions {
-  const o: GetExOptions = {};
+/** SET / SETEX / PSETEX / GETEX: Redis' getExpireMillisecondsOrReply(). Returns an absolute deadline in ms. */
+function setStyleDeadline(e: ExpireArg, cmd: string): number {
+  let ms = toInt64(e.raw);
+  const seconds = e.kind === 'EX' || e.kind === 'EXAT';
+  if (ms <= 0n || (seconds && ms > LLONG_MAX / 1000n)) throw invalidExpire(cmd);
+  if (seconds) ms *= 1000n;
+  if (e.kind === 'EX' || e.kind === 'PX') {
+    const now = BigInt(Date.now());
+    if (ms > LLONG_MAX - now) throw invalidExpire(cmd);
+    ms += now;
+  }
+  return toSafeMs(ms);
+}
+
+/** EXPIRE family: Redis' expireGenericCommand(). Negative values are allowed (they delete the key). */
+function expireStyleDeadline(raw: string, seconds: boolean, absolute: boolean, cmd: string): number {
+  let when = toInt64(raw);
+  if (seconds) {
+    if (when > LLONG_MAX / 1000n || when < LLONG_MIN / 1000n) throw invalidExpire(cmd);
+    when *= 1000n;
+  }
+  const base = absolute ? 0n : BigInt(Date.now());
+  if (when > LLONG_MAX - base) throw invalidExpire(cmd);
+  return toSafeMs(when + base);
+}
+
+interface ExtendedStringOptions {
+  nx?: boolean;
+  xx?: boolean;
+  get?: boolean;
+  keepttl?: boolean;
+  persist?: boolean;
+  expire?: ExpireArg;
+}
+
+/**
+ * Options of SET and GETEX, with the same acceptance rules as Redis 7.0's
+ * parseExtendedStringArgumentsOrReply(): an expire option excludes the other
+ * kinds (repeating the same one is allowed, the last wins), KEEPTTL/PERSIST
+ * exclude expire options, NX and XX exclude each other; anything else is a
+ * syntax error. Values are validated
+ * afterwards (see setStyleDeadline), as in Redis.
+ */
+function parseExtendedOptions(tokens: string[], command: 'set' | 'getex'): ExtendedStringOptions {
+  const o: ExtendedStringOptions = {};
+  const isSet = command === 'set';
   for (let i = 0; i < tokens.length; i++) {
     const flag = tokens[i]!.toUpperCase();
-    const val = (): number => {
-      if (i + 1 >= tokens.length) throw syntaxError();
-      return int(tokens[++i]!);
-    };
-    if (flag === 'PERSIST') o.persist = true;
-    else if (flag === 'EX') o.ex = val();
-    else if (flag === 'PX') o.px = val();
-    else if (flag === 'EXAT') o.exat = val();
-    else if (flag === 'PXAT') o.pxat = val();
-    else throw syntaxError();
+    const next = tokens[i + 1];
+    // Redis 7.0 allows repeating the *same* expire option (the last one wins),
+    // but not mixing EX/PX/EXAT/PXAT/KEEPTTL/PERSIST.
+    const expireAllowed = !o.keepttl && !o.persist && (!o.expire || o.expire.kind === flag);
+    if (isSet && flag === 'NX' && !o.xx) o.nx = true;
+    else if (isSet && flag === 'XX' && !o.nx) o.xx = true;
+    else if (isSet && flag === 'GET') o.get = true;
+    else if (isSet && flag === 'KEEPTTL' && !o.expire && !o.persist) o.keepttl = true;
+    else if (!isSet && flag === 'PERSIST' && !o.expire && !o.keepttl) o.persist = true;
+    else if ((flag === 'EX' || flag === 'PX' || flag === 'EXAT' || flag === 'PXAT') && expireAllowed && next !== undefined) {
+      o.expire = { kind: flag, raw: next };
+      i++;
+    } else {
+      throw syntaxError();
+    }
   }
   return o;
 }
@@ -116,12 +167,27 @@ function parseExpireOptions(tokens: string[]): ExpireOptions {
       throw new ReplyError(`Unsupported option ${t}`);
     }
   }
+  checkExpireFlags(o);
   return o;
 }
 
+const ULONG_MAX = 2n ** 64n - 1n;
+
+/**
+ * Redis parses SCAN cursors with strtoul(): an optional sign and digits, no
+ * leading space, at most 2^64-1, negative values wrap ("-1" is valid). Only
+ * the low 32 bits matter here: they address every bucket of the table.
+ */
 function parseScanCursor(v: string): number {
-  if (!/^\d+$/.test(v) || Number(v) > 0xffffffff) throw new ReplyError('invalid cursor');
-  return Number(v);
+  if (v === '') return 0;
+  const m = /^([+-]?)(\d+)$/.exec(v);
+  if (!m) throw new ReplyError('invalid cursor');
+  const digits = m[2]!.replace(/^0+(?=\d)/, ''); // strtoul accepts leading zeros
+  if (digits.length > 20) throw new ReplyError('invalid cursor');
+  const magnitude = BigInt(digits);
+  if (magnitude > ULONG_MAX) throw new ReplyError('invalid cursor');
+  const value = m[1] === '-' ? (ULONG_MAX + 1n - magnitude) & ULONG_MAX : magnitude;
+  return Number(BigInt.asUintN(32, value));
 }
 
 function parseScanOptions(tokens: string[]): { match?: string; count?: number; type?: string } {
@@ -143,6 +209,8 @@ function parseScanOptions(tokens: string[]): { match?: string; count?: number; t
 function flushArgs(args: string[]): void {
   if (args.length > 1 || (args[0] && !/^(a?sync)$/i.test(args[0]))) throw syntaxError();
 }
+
+const dbInRange = (ctx: CommandContext, index: number): boolean => index >= 0 && index < ctx.store.databases;
 
 function needConn(ctx: CommandContext): ConnectionHandle {
   if (!ctx.conn) throw new ReplyError('this command is only available over the RESP protocol');
@@ -190,7 +258,9 @@ function formatInfo(ctx: CommandContext, wanted: string[]): string {
       ...extra['Stats'],
     },
     Replication: { role: 'master', connected_slaves: 0 },
-    Keyspace: s.keys > 0 ? { db0: `keys=${s.keys},expires=${s.keysWithTtl},avg_ttl=0` } : {},
+    Keyspace: Object.fromEntries(
+      Object.entries(s.keyspace).map(([name, k]) => [name, `keys=${k.keys},expires=${k.expires},avg_ttl=0`]),
+    ),
   };
 
   const all = wanted.length === 0 || wanted.some((w) => /^(all|everything|default)$/i.test(w));
@@ -212,7 +282,7 @@ function configParams(ctx: CommandContext): Record<string, string> {
     'maxmemory-policy': 'noeviction',
     save: '',
     appendonly: 'no',
-    databases: '1',
+    databases: String(ctx.store.databases),
     timeout: String(ctx.serverInfo?.()['Server']?.['idle_timeout'] ?? 0),
     hz: String(Math.max(1, Math.round(1000 / c.cleanupIntervalMs))),
     'proto-max-bulk-len': String(ctx.serverInfo?.()['Server']?.['max_bulk_bytes'] ?? 0),
@@ -247,17 +317,24 @@ export const COMMANDS: Record<string, CommandSpec> = {
     return [String(Math.floor(ms / 1000)), String((ms % 1000) * 1000)];
   }),
   INFO: spec(-1, [], NOKEYS, (ctx, a) => formatInfo(ctx, a)),
-  DBSIZE: spec(1, R, NOKEYS, (ctx) => ctx.store.dbsize()),
+  DBSIZE: spec(1, R, NOKEYS, (ctx) => ctx.db.dbsize()),
   FLUSHALL: spec(-1, ['write'], NOKEYS, (ctx, a) => (flushArgs(a), ctx.store.flushall(), OK)),
-  FLUSHDB: spec(-1, ['write'], NOKEYS, (ctx, a) => (flushArgs(a), ctx.store.flushall(), OK)),
+  FLUSHDB: spec(-1, ['write'], NOKEYS, (ctx, a) => (flushArgs(a), ctx.db.flushdb(), OK)),
+  SWAPDB: spec(3, ['write', 'fast'], NOKEYS, (ctx, a) => {
+    const first = toInt(a[0]!, () => new ReplyError('invalid first DB index'));
+    const second = toInt(a[1]!, () => new ReplyError('invalid second DB index'));
+    if (!dbInRange(ctx, first) || !dbInRange(ctx, second)) throw new ReplyError('DB index is out of range');
+    ctx.store.swapdb(first, second);
+    return OK;
+  }),
   COMMAND: spec(-1, [], NOKEYS, (_, a) => commandReply(a)),
   CONFIG: spec(-2, ['admin'], NOKEYS, (ctx, a) => {
     const sub = a[0]!.toUpperCase();
     if (sub === 'GET') {
       if (a.length < 2) throw new ReplyError("wrong number of arguments for 'config|get' command");
       const params = configParams(ctx);
-      const res = a.slice(1).map((p) => globToRegExp(p.toLowerCase()));
-      return new MapReply(Object.entries(params).filter(([k]) => res.some((re) => re.test(k))));
+      const patterns = a.slice(1);
+      return new MapReply(Object.entries(params).filter(([k]) => patterns.some((p) => globMatch(p, k, true))));
     }
     if (sub === 'RESETSTAT') return OK;
     if (sub === 'SET') throw new ReplyError('CONFIG SET is not supported; configure MIMIC with flags or MIMIC_* environment variables');
@@ -296,6 +373,7 @@ export const COMMANDS: Record<string, CommandSpec> = {
         i += 2;
       } else if (opt === 'SETNAME' && i + 1 < a.length) {
         name = a[++i]!;
+        if (/[^!-~]/.test(name)) throw new ReplyError('Client names cannot contain spaces, newlines or special characters.');
       } else {
         throw new ReplyError(`Syntax error in HELLO option '${a[i]}'`);
       }
@@ -333,8 +411,11 @@ export const COMMANDS: Record<string, CommandSpec> = {
   DISCARD: spec(1, ['fast'], NOKEYS, (ctx) => (needConn(ctx), OK)),
   WATCH: spec(-2, ['fast'], ALLKEYS, (ctx) => (needConn(ctx), OK)),
   UNWATCH: spec(1, ['fast'], NOKEYS, (ctx) => (needConn(ctx), OK)),
-  SELECT: spec(2, ['fast'], NOKEYS, (_, a) => {
-    if (toInt(a[0]!) !== 0) throw new ReplyError('DB index is out of range');
+  SELECT: spec(2, ['fast'], NOKEYS, (ctx, a) => {
+    const conn = needConn(ctx);
+    const index = toInt(a[0]!);
+    if (!dbInRange(ctx, index)) throw new ReplyError('DB index is out of range');
+    conn.db = index;
     return OK;
   }),
   CLIENT: spec(-2, [], NOKEYS, (ctx, a) => {
@@ -347,7 +428,8 @@ export const COMMANDS: Record<string, CommandSpec> = {
         return conn.name || null;
       case 'SETNAME':
         if (a.length !== 2) throw syntaxError();
-        if (/[\s]/.test(a[1]!)) throw new ReplyError('Client names cannot contain spaces, newlines or special characters.');
+        // Redis allows only printable ASCII without spaces ('!' .. '~').
+        if (/[^!-~]/.test(a[1]!)) throw new ReplyError('Client names cannot contain spaces, newlines or special characters.');
         conn.name = a[1]!;
         return OK;
       case 'SETINFO': {
@@ -368,94 +450,134 @@ export const COMMANDS: Record<string, CommandSpec> = {
   }),
 
   // strings
-  SET: spec(-3, ['write'], K1, ({ store }, a) => {
-    const opts = parseSetOptions(a.slice(2));
-    const r = store.set(a[0]!, a[1]!, opts);
-    if (opts.get) return r.previous;
+  SET: spec(-3, ['write'], K1, ({ db }, a) => {
+    const o = parseExtendedOptions(a.slice(2), 'set');
+    const pxat = o.expire ? setStyleDeadline(o.expire, 'set') : undefined;
+    const r = db.set(a[0]!, a[1]!, { nx: !!o.nx, xx: !!o.xx, get: !!o.get, keepttl: !!o.keepttl, ...(pxat !== undefined ? { pxat } : {}) });
+    if (o.get) return r.previous;
     return r.written ? OK : null;
   }),
-  SETNX: spec(3, W, K1, ({ store }, a) => (store.set(a[0]!, a[1]!, { nx: true }).written ? 1 : 0)),
-  SETEX: spec(4, ['write'], K1, ({ store }, a) => (store.set(a[0]!, a[2]!, { ex: int(a[1]!) }), OK)),
-  PSETEX: spec(4, ['write'], K1, ({ store }, a) => (store.set(a[0]!, a[2]!, { px: int(a[1]!) }), OK)),
-  GET: spec(2, R, K1, ({ store }, a) => store.get(a[0]!)),
-  GETDEL: spec(2, W, K1, ({ store }, a) => store.getdel(a[0]!)),
-  GETEX: spec(-2, W, K1, ({ store }, a) => store.getex(a[0]!, parseGetExOptions(a.slice(1)))),
-  GETSET: spec(3, W, K1, ({ store }, a) => store.set(a[0]!, a[1]!, { get: true }).previous),
-  GETRANGE: spec(4, R, K1, ({ store }, a) => store.getrange(a[0]!, int(a[1]!), int(a[2]!))),
-  MGET: spec(-2, R, ALLKEYS, ({ store }, a) => store.mget(a)),
-  MSET: spec(-3, ['write'], [1, -1, 2], ({ store }, a) => (store.mset(pairs('mset', a)), OK)),
-  MSETNX: spec(-3, ['write'], [1, -1, 2], ({ store }, a) => (store.msetnx(pairs('msetnx', a)) ? 1 : 0)),
-  INCR: spec(2, W, K1, ({ store }, a) => store.incrby(a[0]!, 1n)),
-  DECR: spec(2, W, K1, ({ store }, a) => store.incrby(a[0]!, -1n)),
-  INCRBY: spec(3, W, K1, ({ store }, a) => store.incrby(a[0]!, bigint(a[1]!))),
-  DECRBY: spec(3, W, K1, ({ store }, a) => store.incrby(a[0]!, -bigint(a[1]!))),
-  APPEND: spec(3, W, K1, ({ store }, a) => store.append(a[0]!, a[1]!)),
-  STRLEN: spec(2, R, K1, ({ store }, a) => store.strlen(a[0]!)),
+  SETNX: spec(3, W, K1, ({ db }, a) => (db.set(a[0]!, a[1]!, { nx: true }).written ? 1 : 0)),
+  SETEX: spec(4, ['write'], K1, ({ db }, a) => {
+    const pxat = setStyleDeadline({ kind: 'EX', raw: a[1]! }, 'setex');
+    db.set(a[0]!, a[2]!, { pxat });
+    return OK;
+  }),
+  PSETEX: spec(4, ['write'], K1, ({ db }, a) => {
+    const pxat = setStyleDeadline({ kind: 'PX', raw: a[1]! }, 'psetex');
+    db.set(a[0]!, a[2]!, { pxat });
+    return OK;
+  }),
+  GET: spec(2, R, K1, ({ db }, a) => db.get(a[0]!)),
+  GETDEL: spec(2, W, K1, ({ db }, a) => db.getdel(a[0]!)),
+  GETEX: spec(-2, W, K1, ({ db }, a) => {
+    // Same order as Redis: options, then the key (nil / WRONGTYPE), then the expire value.
+    const o = parseExtendedOptions(a.slice(1), 'getex');
+    const value = db.get(a[0]!);
+    if (value === null) return null;
+    if (o.expire) db.getex(a[0]!, { pxat: setStyleDeadline(o.expire, 'getex') }, false);
+    else if (o.persist) db.getex(a[0]!, { persist: true }, false);
+    return value;
+  }),
+  GETSET: spec(3, W, K1, ({ db }, a) => db.set(a[0]!, a[1]!, { get: true }).previous),
+  GETRANGE: spec(4, R, K1, ({ db }, a) => db.getrange(a[0]!, int(a[1]!), int(a[2]!))),
+  MGET: spec(-2, R, ALLKEYS, ({ db }, a) => db.mget(a)),
+  MSET: spec(-3, ['write'], [1, -1, 2], ({ db }, a) => (db.mset(pairs('mset', a)), OK)),
+  MSETNX: spec(-3, ['write'], [1, -1, 2], ({ db }, a) => (db.msetnx(pairs('msetnx', a)) ? 1 : 0)),
+  INCR: spec(2, W, K1, ({ db }, a) => db.incrby(a[0]!, 1n)),
+  DECR: spec(2, W, K1, ({ db }, a) => db.incrby(a[0]!, -1n)),
+  INCRBY: spec(3, W, K1, ({ db }, a) => db.incrby(a[0]!, bigint(a[1]!))),
+  DECRBY: spec(3, W, K1, ({ db }, a) => {
+    const by = bigint(a[1]!);
+    if (by === -(2n ** 63n)) throw new ReplyError('decrement would overflow');
+    return db.incrby(a[0]!, -by);
+  }),
+  APPEND: spec(3, W, K1, ({ db }, a) => db.append(a[0]!, a[1]!)),
+  STRLEN: spec(2, R, K1, ({ db }, a) => db.strlen(a[0]!)),
 
   // keys
-  DEL: spec(-2, ['write'], ALLKEYS, ({ store }, a) => store.del(a)),
-  UNLINK: spec(-2, W, ALLKEYS, ({ store }, a) => store.del(a)),
-  EXISTS: spec(-2, R, ALLKEYS, ({ store }, a) => store.exists(a)),
-  TOUCH: spec(-2, R, ALLKEYS, ({ store }, a) => store.exists(a)),
-  TYPE: spec(2, R, K1, ({ store }, a) => new SimpleString(store.type(a[0]!))),
-  KEYS: spec(2, ['readonly'], NOKEYS, ({ store }, a) => store.keys(a[0]!)),
-  SCAN: spec(-2, ['readonly'], NOKEYS, ({ store }, a) => {
-    const [next, keys] = store.scan(parseScanCursor(a[0]!), parseScanOptions(a.slice(1)));
+  DEL: spec(-2, ['write'], ALLKEYS, ({ db }, a) => db.del(a)),
+  UNLINK: spec(-2, W, ALLKEYS, ({ db }, a) => db.del(a)),
+  EXISTS: spec(-2, R, ALLKEYS, ({ db }, a) => db.exists(a)),
+  TOUCH: spec(-2, R, ALLKEYS, ({ db }, a) => db.exists(a)),
+  TYPE: spec(2, R, K1, ({ db }, a) => new SimpleString(db.type(a[0]!))),
+  KEYS: spec(2, ['readonly'], NOKEYS, ({ db }, a) => db.keys(a[0]!)),
+  SCAN: spec(-2, ['readonly'], NOKEYS, ({ db }, a) => {
+    const [next, keys] = db.scan(parseScanCursor(a[0]!), parseScanOptions(a.slice(1)));
     return [String(next), keys];
   }),
-  RENAME: spec(3, ['write'], [1, 2, 1], ({ store }, a) => (store.rename(a[0]!, a[1]!), OK)),
-  RENAMENX: spec(3, W, [1, 2, 1], ({ store }, a) => {
-    if (store.exists([a[1]!])) {
-      if (!store.exists([a[0]!])) throw new ReplyError('no such key');
+  RENAME: spec(3, ['write'], [1, 2, 1], ({ db }, a) => (db.rename(a[0]!, a[1]!), OK)),
+  MOVE: spec(3, W, K1, (ctx, a) => {
+    const target = toInt(a[1]!);
+    if (!dbInRange(ctx, target)) throw new ReplyError('DB index is out of range');
+    return ctx.store.move(a[0]!, ctx.db.index, target);
+  }),
+  RENAMENX: spec(3, W, [1, 2, 1], ({ db }, a) => {
+    if (db.exists([a[1]!])) {
+      if (!db.exists([a[0]!])) throw new ReplyError('no such key');
       return 0;
     }
-    store.rename(a[0]!, a[1]!);
+    db.rename(a[0]!, a[1]!);
     return 1;
   }),
 
   // TTL
-  EXPIRE: spec(-3, W, K1, ({ store }, a) => store.expire(a[0]!, int(a[1]!), parseExpireOptions(a.slice(2)))),
-  PEXPIRE: spec(-3, W, K1, ({ store }, a) => store.pexpire(a[0]!, int(a[1]!), parseExpireOptions(a.slice(2)))),
-  EXPIREAT: spec(-3, W, K1, ({ store }, a) => store.expireat(a[0]!, int(a[1]!), parseExpireOptions(a.slice(2)))),
-  PEXPIREAT: spec(-3, W, K1, ({ store }, a) => store.pexpireat(a[0]!, int(a[1]!), parseExpireOptions(a.slice(2)))),
-  TTL: spec(2, R, K1, ({ store }, a) => store.ttl(a[0]!)),
-  PTTL: spec(2, R, K1, ({ store }, a) => store.pttl(a[0]!)),
-  EXPIRETIME: spec(2, R, K1, ({ store }, a) => {
-    const t = store.pexpiretime(a[0]!);
+  EXPIRE: spec(-3, W, K1, ({ db }, a) => {
+    const opts = parseExpireOptions(a.slice(2));
+    return db.pexpireat(a[0]!, expireStyleDeadline(a[1]!, true, false, 'expire'), opts);
+  }),
+  PEXPIRE: spec(-3, W, K1, ({ db }, a) => {
+    const opts = parseExpireOptions(a.slice(2));
+    return db.pexpireat(a[0]!, expireStyleDeadline(a[1]!, false, false, 'pexpire'), opts);
+  }),
+  EXPIREAT: spec(-3, W, K1, ({ db }, a) => {
+    const opts = parseExpireOptions(a.slice(2));
+    return db.pexpireat(a[0]!, expireStyleDeadline(a[1]!, true, true, 'expireat'), opts);
+  }),
+  PEXPIREAT: spec(-3, W, K1, ({ db }, a) => {
+    const opts = parseExpireOptions(a.slice(2));
+    return db.pexpireat(a[0]!, expireStyleDeadline(a[1]!, false, true, 'pexpireat'), opts);
+  }),
+  TTL: spec(2, R, K1, ({ db }, a) => db.ttl(a[0]!)),
+  PTTL: spec(2, R, K1, ({ db }, a) => db.pttl(a[0]!)),
+  EXPIRETIME: spec(2, R, K1, ({ db }, a) => {
+    const t = db.pexpiretime(a[0]!);
     return t < 0 ? t : Math.round(t / 1000);
   }),
-  PEXPIRETIME: spec(2, R, K1, ({ store }, a) => store.pexpiretime(a[0]!)),
-  PERSIST: spec(2, W, K1, ({ store }, a) => store.persist(a[0]!)),
+  PEXPIRETIME: spec(2, R, K1, ({ db }, a) => db.pexpiretime(a[0]!)),
+  PERSIST: spec(2, W, K1, ({ db }, a) => db.persist(a[0]!)),
 
   // hashes
-  HSET: spec(-4, W, K1, ({ store }, a) => store.hset(a[0]!, pairs('hset', a, 1))),
-  HMSET: spec(-4, W, K1, ({ store }, a) => (store.hset(a[0]!, pairs('hmset', a, 1)), OK)),
-  HSETNX: spec(4, W, K1, ({ store }, a) => store.hsetnx(a[0]!, a[1]!, a[2]!)),
-  HGET: spec(3, R, K1, ({ store }, a) => store.hget(a[0]!, a[1]!)),
-  HMGET: spec(-3, R, K1, ({ store }, a) => store.hmget(a[0]!, a.slice(1))),
-  HDEL: spec(-3, W, K1, ({ store }, a) => store.hdel(a[0]!, a.slice(1))),
-  HGETALL: spec(2, ['readonly'], K1, ({ store }, a) => new MapReply(store.hgetall(a[0]!))),
-  HEXISTS: spec(3, R, K1, ({ store }, a) => store.hexists(a[0]!, a[1]!)),
-  HLEN: spec(2, R, K1, ({ store }, a) => store.hlen(a[0]!)),
-  HKEYS: spec(2, ['readonly'], K1, ({ store }, a) => store.hkeys(a[0]!)),
-  HVALS: spec(2, ['readonly'], K1, ({ store }, a) => store.hvals(a[0]!)),
-  HINCRBY: spec(4, W, K1, ({ store }, a) => store.hincrby(a[0]!, a[1]!, bigint(a[2]!))),
+  HSET: spec(-4, W, K1, ({ db }, a) => db.hset(a[0]!, pairs('hset', a, 1))),
+  HMSET: spec(-4, W, K1, ({ db }, a) => (db.hset(a[0]!, pairs('hmset', a, 1)), OK)),
+  HSETNX: spec(4, W, K1, ({ db }, a) => db.hsetnx(a[0]!, a[1]!, a[2]!)),
+  HGET: spec(3, R, K1, ({ db }, a) => db.hget(a[0]!, a[1]!)),
+  HMGET: spec(-3, R, K1, ({ db }, a) => db.hmget(a[0]!, a.slice(1))),
+  HDEL: spec(-3, W, K1, ({ db }, a) => db.hdel(a[0]!, a.slice(1))),
+  HGETALL: spec(2, ['readonly'], K1, ({ db }, a) => new MapReply(db.hgetall(a[0]!))),
+  HEXISTS: spec(3, R, K1, ({ db }, a) => db.hexists(a[0]!, a[1]!)),
+  HLEN: spec(2, R, K1, ({ db }, a) => db.hlen(a[0]!)),
+  HKEYS: spec(2, ['readonly'], K1, ({ db }, a) => db.hkeys(a[0]!)),
+  HVALS: spec(2, ['readonly'], K1, ({ db }, a) => db.hvals(a[0]!)),
+  HINCRBY: spec(4, W, K1, ({ db }, a) => db.hincrby(a[0]!, a[1]!, bigint(a[2]!))),
 
   // lists
-  LPUSH: spec(-3, W, K1, ({ store }, a) => store.lpush(a[0]!, a.slice(1))),
-  RPUSH: spec(-3, W, K1, ({ store }, a) => store.rpush(a[0]!, a.slice(1))),
-  LPOP: spec(-2, W, K1, ({ store }, a) => {
-    if (a.length > 2) throw syntaxError();
-    return store.lpop(a[0]!, a[1] === undefined ? undefined : positiveInt(a[1]));
+  LPUSH: spec(-3, W, K1, ({ db }, a) => db.lpush(a[0]!, a.slice(1))),
+  RPUSH: spec(-3, W, K1, ({ db }, a) => db.rpush(a[0]!, a.slice(1))),
+  LPOP: spec(-2, W, K1, ({ db }, a) => {
+    if (a.length > 2) throw new ReplyError("wrong number of arguments for 'lpop' command");
+    if (a[1] === undefined) return db.lpop(a[0]!);
+    return db.lpop(a[0]!, positiveInt(a[1])) ?? NULL_ARRAY; // with a count, a missing key is a null array
   }),
-  RPOP: spec(-2, W, K1, ({ store }, a) => {
-    if (a.length > 2) throw syntaxError();
-    return store.rpop(a[0]!, a[1] === undefined ? undefined : positiveInt(a[1]));
+  RPOP: spec(-2, W, K1, ({ db }, a) => {
+    if (a.length > 2) throw new ReplyError("wrong number of arguments for 'rpop' command");
+    if (a[1] === undefined) return db.rpop(a[0]!);
+    return db.rpop(a[0]!, positiveInt(a[1])) ?? NULL_ARRAY; // with a count, a missing key is a null array
   }),
-  LRANGE: spec(4, ['readonly'], K1, ({ store }, a) => store.lrange(a[0]!, int(a[1]!), int(a[2]!))),
-  LINDEX: spec(3, ['readonly'], K1, ({ store }, a) => store.lindex(a[0]!, int(a[1]!))),
-  LTRIM: spec(4, ['write'], K1, ({ store }, a) => (store.ltrim(a[0]!, int(a[1]!), int(a[2]!)), OK)),
-  LLEN: spec(2, R, K1, ({ store }, a) => store.llen(a[0]!)),
+  LRANGE: spec(4, ['readonly'], K1, ({ db }, a) => db.lrange(a[0]!, int(a[1]!), int(a[2]!))),
+  LINDEX: spec(3, ['readonly'], K1, ({ db }, a) => db.lindex(a[0]!, a[1]!)),
+  LTRIM: spec(4, ['write'], K1, ({ db }, a) => (db.ltrim(a[0]!, int(a[1]!), int(a[2]!)), OK)),
+  LLEN: spec(2, R, K1, ({ db }, a) => db.llen(a[0]!)),
 };
 
 /** Commands that may run before AUTH succeeds. */
@@ -491,10 +613,9 @@ export function resolveCommand(argv: string[]): CommandSpec {
   const name = argv[0]!;
   const cmd = COMMANDS[name.toUpperCase()];
   if (!cmd) {
-    const args = argv
-      .slice(1, 8)
-      .map((x) => `'${x.slice(0, 64)}'`)
-      .join(' ');
+    // Same text as Redis 7: each argument quoted and followed by a space, 128 chars in total.
+    let args = '';
+    for (let i = 1; i < argv.length && args.length < 128; i++) args += `'${argv[i]!.slice(0, 128 - args.length)}' `;
     throw new ReplyError(`unknown command '${name.slice(0, 128)}', with args beginning with: ${args}`);
   }
   const n = argv.length;

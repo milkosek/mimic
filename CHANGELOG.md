@@ -6,7 +6,8 @@
 - **Redis protocol (RESP) over TCP.** redis-cli, ioredis, node-redis, redis-py and other standard clients work without changes.
   - RESP2 by default, RESP3 after `HELLO 3`.
   - Pipelining, backpressure, inline commands (telnet/nc).
-  - `AUTH`, `HELLO`, `CLIENT`, `SELECT 0`, `QUIT`, `RESET`.
+  - `AUTH`, `HELLO`, `CLIENT`, `QUIT`, `RESET`.
+- **16 databases**, as in Redis: `SELECT`, `MOVE`, `SWAPDB`, `FLUSHDB` and `FLUSHALL`, with `--databases` to change the count. Over HTTP, use `?db=N`.
 - `MULTI` / `EXEC` / `DISCARD`, and optimistic locking with `WATCH` / `UNWATCH`.
 - **Proper `SCAN`.** It uses a stateless reverse-binary cursor over a bucket table, like Redis' `dictScan`. A full scan returns every key that exists for the whole scan, even while the table grows or shrinks. `MATCH`, `COUNT` and `TYPE` are supported.
 - Binary-safe keys and values; `STRLEN` and `APPEND` count bytes.
@@ -21,6 +22,70 @@
   - Server: `TIME`, `CONFIG GET`, `COMMAND COUNT/INFO/LIST/DOCS`
 - The HTTP API is kept alongside RESP (it can be turned off). `GET /keys` now accepts a `cursor` for SCAN.
 - Configuration through `MIMIC_*` environment variables or command-line flags, plus `--password-file`.
+- **Verified against Redis 7.0.** A compatibility test compares raw replies with a real `redis-server` for more than 500 hand-picked commands. It also runs seeded random command streams over RESP2 and RESP3, and a seeded fuzz of glob patterns.
+
+### Fixed during the pre-release review
+
+Security and robustness:
+
+- A client resetting its connection while being turned away at `--max-clients` crashed the server, and the whole cache was lost.
+- Web pages could write to the cache through the browser:
+  - HTTP now requires `Content-Type: application/json` and refuses foreign `Origin` headers. Without a password it also checks the `Host` header, which blocks DNS rebinding.
+  - On the RESP port, a `POST` or `Host:` line now drops the connection before anything runs, as in Redis.
+- Unauthenticated clients could make the server buffer unlimited data. They now get Redis' limits (10 arguments, 16 KB each), and each client's input is capped by `--max-query-buffer` (1 GB).
+- An empty password, an empty password file, or a password env var that was set but empty silently disabled authentication. Each is now a startup error.
+- WATCH didn't see writes made over HTTP, or by code embedding MIMIC. Change notifications now come from the data layer itself.
+- WATCH was invalidated by writes that changed nothing, such as a failed `SETNX`. It wasn't invalidated by a watched key expiring. Both now behave as in Redis.
+
+Correctness and performance:
+
+- Valid commands arriving in the same TCP chunk as a malformed frame were thrown away.
+- The parser re-read a whole frame on every new chunk, making many-argument commands quadratic. It is now linear.
+- The SCAN bucket table was rehashed in one go. It is now incremental, like Redis.
+- HTTP bodies over the limit got a connection reset instead of a 413.
+- `--password-file` on the command line didn't win over `MIMIC_PASSWORD` from the environment.
+- HTTP integer replies became strings above 2^53. They are now always JSON numbers, with full precision.
+- Keys containing `..`, `/` or `\` couldn't be reached through `/keys/:key`.
+
+Found by a second, adversarial review, each reproduced and then fixed:
+
+- **A pipeline whose replies added up to more than about 512 MB crashed the process.** Replies are now written in 64 KB pieces with real backpressure: while a client isn't reading, MIMIC stops running its commands.
+- **`KEYS`/`SCAN` patterns such as `*?*?*?…x` hung the server** through regex backtracking. A web page could trigger it with a plain GET. Matching is now a port of Redis' `stringmatchlen()` with its CVE-2022-36021 protections, and cross-site browser GETs are refused using `Sec-Fetch-Site`.
+- A multi-megabyte integer argument stalled the event loop. It is now rejected before any big-number parsing.
+- A small leftover after a large command kept the whole large buffer in memory.
+- `FLUSHDB`, `FLUSHALL` and `SWAPDB` invalidated every watched key. Like Redis, they now invalidate only keys that existed.
+- `PUT /keys/:key` with a bare JSON value returned 500 instead of 400.
+- `EXEC` with arguments inside `MULTI` now aborts the transaction, as Redis does.
+- Before AUTH, unknown-command and arity errors now come before `NOAUTH`, in Redis' order.
+- Closed connections are fully released even if the peer never closes its side. The close waits while a slow reader is still receiving data.
+- Other small fixes:
+  - `CLIENT SETNAME` and `HELLO … SETNAME` reject control characters.
+  - `AUTH`/`HELLO` with an unknown user is `WRONGPASS` even without a password.
+  - `Host: localhost.` is accepted.
+  - The store's change listener is released when startup fails.
+  - The daemon only stops a store timer it started itself.
+
+Redis compatibility (each case checked against `redis-server`):
+
+- Integers are parsed like Redis' `string2ll`: `"007"`, `"+5"` and `"-0"` are rejected.
+- Errors:
+  - Messages starting with a capitalised word (for example "GT and LT …" or "MULTI calls can not be nested") were missing the `ERR` prefix.
+  - The unknown-command error now has Redis' exact wording, including the trailing space.
+  - `DECRBY` with the minimum 64-bit value reports "decrement would overflow".
+  - A bad count for `LPOP`/`RPOP` reports "value is out of range, must be positive".
+- Expire times:
+  - Values are checked exactly as in Redis. Out-of-range values give "invalid expire time in '<command>' command", with the name of the command actually called.
+  - Mixing expire options in `SET` or `GETEX` is a syntax error. Repeating the same one is allowed, and the last one wins; that is what Redis 7.0 does.
+- Replies:
+  - An `EXEC` aborted by WATCH, and `LPOP`/`RPOP` with a count on a missing key, now return a null array (`*-1`).
+  - `GETRANGE` clamps a too-negative end index the way Redis does.
+- Order of checks:
+  - `LINDEX` checks the key's type before parsing the index.
+  - `GETEX` looks up the key before validating the expire value.
+- Inline commands follow Redis' tokeniser (`sdssplitargs`). Unbalanced quotes are a protocol error.
+- `SCAN` cursors are parsed like `strtoul`, so `SCAN -1` is valid.
+- Glob patterns follow `stringmatchlen()`, quirks included: an unterminated `[` is a class to the end of the pattern, `[]` matches nothing, and reversed ranges are swapped. A seeded fuzz compares random patterns with Redis' `KEYS`.
+- The pre-AUTH limit checks follow Redis' order, and the multibulk limit is `INT_MAX` as in Redis; `--max-query-buffer` bounds memory.
 
 ## 0.1.0
 

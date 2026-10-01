@@ -41,7 +41,14 @@ export async function startDaemon(config: MimicConfig, logger: Logger = NOOP_LOG
     cleanupIntervalMs: config.cleanupIntervalMs,
     sampleSize: config.cleanupSampleSize,
     timeBudgetMs: config.cleanupTimeBudgetMs,
-  }).start();
+    databases: config.databases,
+  });
+  // Only stop the timer later if this daemon started it (embedding code may own it).
+  const startedTimer = !store.running;
+  store.start();
+  const stopTimer = (): void => {
+    if (startedTimer) store.stop();
+  };
 
   let httpPort: number | null = null;
   const extraInfo = (): InfoSections => ({ Server: { http_port: httpPort ?? 0 } });
@@ -51,17 +58,27 @@ export async function startDaemon(config: MimicConfig, logger: Logger = NOOP_LOG
     maxClients: config.maxClients,
     idleTimeoutSec: config.idleTimeoutSec,
     limits: { maxBulkLength: config.maxBulkBytes },
+    maxQueryBufferBytes: config.maxQueryBufferBytes,
     logger,
     extraInfo,
   });
 
   let httpServer: http.Server | null = null;
-  const respPort = await listen(resp, config.port, config.host);
+  let respPort: number;
+  try {
+    respPort = await listen(resp, config.port, config.host);
+  } catch (err) {
+    resp.dispose(); // never listened, so 'close' won't fire to unsubscribe
+    stopTimer();
+    throw err;
+  }
   try {
     if (config.httpPort !== null) {
       httpServer = createHttpServer(store, {
         ...(config.password ? { authToken: config.password } : {}),
         bodyLimitBytes: config.httpBodyLimitBytes,
+        allowedOrigins: config.httpAllowedOrigins,
+        allowedHosts: config.httpAllowedHosts,
         logger,
         extraInfo: () => ({ ...extraInfo(), Clients: { connected_clients: resp.stats.connectedClients } }),
       });
@@ -69,7 +86,8 @@ export async function startDaemon(config: MimicConfig, logger: Logger = NOOP_LOG
     }
   } catch (err) {
     resp.close();
-    store.stop();
+    resp.dispose();
+    stopTimer();
     throw err;
   }
 
@@ -78,7 +96,7 @@ export async function startDaemon(config: MimicConfig, logger: Logger = NOOP_LOG
   }
 
   const close = async (): Promise<void> => {
-    store.stop();
+    stopTimer();
     const closing: Promise<void>[] = [new Promise((r) => resp.close(() => r()))];
     resp.disconnectAll();
     if (httpServer) {

@@ -3,8 +3,8 @@
 // Library entry point: embed MIMIC in your own Node.js process, or use the
 // `mimic` CLI (dist/cli.js) to run it as a daemon.
 
-export { Store } from './store.js';
-export type { Entry, EntryType, SetOptions, SetResult, ExpireOptions, GetExOptions, ScanOptions, StoreOptions, StoreInfo } from './store.js';
+export { Database, Store } from './store.js';
+export type { Entry, EntryType, KeyspaceListener, SetOptions, SetResult, ExpireOptions, GetExOptions, ScanOptions, StoreOptions, StoreInfo } from './store.js';
 export { Keyspace } from './keyspace.js';
 export { COMMANDS, execute } from './commands.js';
 export type { CommandContext, CommandSpec, ConnectionHandle, InfoSections } from './commands.js';

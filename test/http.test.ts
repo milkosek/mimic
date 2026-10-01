@@ -70,7 +70,14 @@ test('GET /keys with and without a cursor', async () => {
 });
 
 test('bad JSON and unknown routes', async () => {
-  const res = await fetch(`${base}/command`, { method: 'POST', headers: { authorization: `Bearer ${TOKEN}` }, body: '{oops' });
+  const res = await fetch(`${base}/command`, { method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: '{oops' });
   assert.equal(res.status, 400);
   assert.equal((await call('GET', '/nope')).status, 404);
+});
+
+test('?db=N selects the database', async () => {
+  await call('POST', '/command?db=3', ['SET', 'dbkey', 'in-three']);
+  assert.equal((await call('POST', '/command', ['EXISTS', 'dbkey'])).body.result, 0);
+  assert.equal((await call('GET', '/keys/dbkey?db=3')).body.value, 'in-three');
+  assert.equal((await call('GET', '/keys/dbkey?db=99')).status, 400);
 });
