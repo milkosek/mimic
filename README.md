@@ -34,6 +34,7 @@ Redis is great, but you can't always install it. **IBM i (PASE)** is the classic
 - [Development](#development)
 - [Security](#security)
 - [Roadmap](#roadmap)
+- [Background](#background)
 - [License](#license)
 
 ## Quick start
@@ -281,6 +282,8 @@ npm run typecheck
 
 `npm run test:compat` includes `test/compat.redis-diff.test.ts`. It starts a real `redis-server` on a random port (the test is skipped if `redis-server` isn't installed) and sends both servers the same commands: hand-picked cases, plus a seeded random stream over RESP2 and RESP3. Every reply must match exactly. To replay a random run, set `FUZZ_SEED=<number>`.
 
+[ARCHITECTURE.md](ARCHITECTURE.md) explains how the code fits together: the life of a command from socket to store, the core ideas, a map of the files, how to add a command, and a suggested reading order.
+
 The compatibility tests use the current ioredis and node-redis releases, which need Node 20 or newer. The server itself, and the regular tests, run on Node 18 and newer.
 
 ```
@@ -296,6 +299,8 @@ src/
 ```
 
 ## Security
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md). It also describes the security model, the known limitations and a deployment checklist (including IBM i).
 
 - By default MIMIC binds to `127.0.0.1` and requires no password. If it listens on anything else without a password, it logs a warning.
 - **Web pages can't use your cache.** A page open in a browser on the same machine could otherwise reach `localhost`. MIMIC blocks that in three ways:
@@ -317,8 +322,14 @@ src/
 - Pub/Sub and keyspace notifications
 - Prometheus `/metrics`
 
+## Background
+
+MIMIC started from Mateusz Milkowski's idea: a small Node.js daemon that keeps key/value data in a singleton class backed by a `Map`, with TTLs cleaned up both lazily on access and by an interval timer, like Redis. That design is still the core of MIMIC (`Store` in [`src/store.ts`](src/store.ts)).
+
+From there, the project was expanded with the help of Claude, Anthropic's AI assistant, into what it is now: the Redis protocol server, the TypeScript rewrite, SCAN, multiple databases, transactions and the compatibility test suite. Mateusz directed that work, and reviewed, tested and hardened it: several review rounds found the problems listed in the [CHANGELOG](CHANGELOG.md), and each one was reproduced, fixed and covered by a test.
+
 ## License
 
 Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-MIMIC is an independent implementation of the Redis protocol and contains no Redis source code. Redis is a registered trademark of Redis Ltd. Any rights therein are reserved to Redis Ltd. MIMIC is not affiliated with, sponsored by or endorsed by Redis Ltd.
+MIMIC is an independent implementation of the Redis protocol. A few functions are ports of Redis' own BSD-licensed code (the glob matcher, the inline-command splitter and the SCAN cursor algorithm); they are credited in [NOTICE](NOTICE), and the Redis license is in [licenses/](licenses/redis-BSD-3-Clause.txt). Thanks to Salvatore Sanfilippo and the Redis contributors. Redis is a registered trademark of Redis Ltd. Any rights therein are reserved to Redis Ltd. MIMIC is not affiliated with, sponsored by or endorsed by Redis Ltd.

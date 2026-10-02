@@ -4,5 +4,31 @@ Copyright 2026 Mateusz Milkowski
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 MIMIC implements the Redis serialization protocol (RESP) so that existing Redis
-clients can talk to it. It contains no Redis source code. Redis is a registered
-trademark of Redis Ltd.; MIMIC is not affiliated with or endorsed by Redis Ltd.
+clients can talk to it. Redis is a registered trademark of Redis Ltd.; MIMIC is
+not affiliated with or endorsed by Redis Ltd.
+
+Portions derived from Redis
+---------------------------
+
+Some functions in MIMIC are ports of Redis 7.0 source code (C, translated to
+TypeScript). Redis 7.0 is licensed under the BSD 3-Clause license; its
+copyright notices and license text are in licenses/redis-BSD-3-Clause.txt, and
+those portions remain under that license:
+
+  * src/util.ts, globMatch(): port of stringmatchlen() from Redis' util.c,
+    including its protections against CVE-2022-36021.
+    Copyright (c) 2009-2012, Salvatore Sanfilippo.
+
+  * src/resp/parser.ts, splitArgs(): port of sdssplitargs() from Redis' sds.c.
+    Copyright (c) 2006-2015, Salvatore Sanfilippo; Copyright (c) 2015,
+    Oran Agra; Copyright (c) 2015, Redis Labs, Inc.
+
+  * src/keyspace.ts, the SCAN cursor: the reverse-binary iteration of
+    dictScan() from Redis' dict.c, an algorithm designed by Pieter Noordhuis.
+    Copyright (c) 2006-2012, Salvatore Sanfilippo.
+
+Other parts follow Redis' documented behaviour without porting its code: the
+active expiry cycle (modelled on activeExpireCycle() in expire.c), integer
+parsing with string2ll() rules, the order of argument checks, and error
+messages and reply formats, which match Redis' so that clients behave the
+same. Thanks to Salvatore Sanfilippo and the Redis contributors.

@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+//
+// globMatch() is a port of stringmatchlen() from Redis 7.0 (src/util.c),
+// Copyright (c) 2009-2012, Salvatore Sanfilippo, BSD 3-Clause license;
+// see NOTICE and licenses/redis-BSD-3-Clause.txt.
 
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { notInteger, ReplyError } from './reply.js';

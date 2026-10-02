@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
+// splitArgs() is a port of sdssplitargs() from Redis 7.0 (src/sds.c),
+// Copyright (c) 2006-2015, Salvatore Sanfilippo; (c) 2015, Oran Agra;
+// (c) 2015, Redis Labs, Inc. BSD 3-Clause license; see NOTICE and
+// licenses/redis-BSD-3-Clause.txt.
+//
 // Streaming RESP request parser.
 //
 // Clients send commands as arrays of bulk strings:

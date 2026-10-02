@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
+// The SCAN cursor follows dictScan() from Redis 7.0 (src/dict.c), an
+// algorithm designed by Pieter Noordhuis; Copyright (c) 2006-2012, Salvatore
+// Sanfilippo, BSD 3-Clause license. See NOTICE and
+// licenses/redis-BSD-3-Clause.txt.
+//
 // Keyspace: a Map for O(1) lookups plus a power-of-two bucket table that
 // exists only to support SCAN with the same guarantees Redis gives:
 //
