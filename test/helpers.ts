@@ -1,11 +1,12 @@
 import net from 'node:net';
 import { loadConfig, type MimicConfig } from '../src/config.js';
 import { startDaemon, type Daemon } from '../src/daemon.js';
+import type { Logger } from '../src/resp/server.js';
 
 /** Start a daemon on random ports. */
-export async function startTestDaemon(overrides: Partial<MimicConfig> = {}): Promise<Daemon> {
+export async function startTestDaemon(overrides: Partial<MimicConfig> = {}, logger?: Logger): Promise<Daemon> {
   const { config } = loadConfig([], {});
-  return startDaemon({ ...config, port: 0, httpPort: 0, cleanupIntervalMs: 20, ...overrides });
+  return startDaemon({ ...config, port: 0, httpPort: 0, cleanupIntervalMs: 20, ...overrides }, logger);
 }
 
 /** Minimal raw RESP client: send bytes, collect the reply bytes until `until` matches or the socket closes. */

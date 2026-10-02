@@ -102,6 +102,7 @@ Hard edge cases from the next review round, fixed where the fix was simpler than
   - `SELECT`, `MOVE` and `SWAPDB` reject indexes outside 32 bits with Redis' messages.
   - `CONFIG GET` echoes an exact parameter name as given (`CONFIG GET DATABASES`); patterns return canonical names.
   - The HTTP `Host` check accepted any name containing `:`; it now only skips IPv6 literals.
+- `--log-level debug` was accepted but logged nothing extra. It now logs every RESP connection, every command (RESP and HTTP) with a short form of its reply, and each HTTP request's status and time. Values are truncated and passwords masked.
 - Left as documented differences: expire times beyond 2^53 ms are capped, and multi-million-key heaps see occasional V8 pauses of a few hundred ms.
 
 ## 0.1.0

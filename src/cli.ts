@@ -34,6 +34,7 @@ async function main(): Promise<void> {
   log.info(`RESP listening on ${config.host}:${daemon.respPort}`);
   if (daemon.httpPort !== null) log.info(`HTTP listening on ${config.httpHost}:${daemon.httpPort}`);
   if (!config.password) log.info('no password set - clients do not need to AUTH');
+  log.debug?.('debug logging is on: every connection and command is logged, with values (truncated) - mind sensitive data');
 
   let stopping = false;
   const shutdown = (reason: string, code = 0): void => {

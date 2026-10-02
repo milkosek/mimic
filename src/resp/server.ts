@@ -16,6 +16,7 @@
 
 import net from 'node:net';
 import { checkMemory, NO_AUTH_COMMANDS, resolveCommand, type CommandSpec, type ConnectionHandle, type InfoSections } from '../commands.js';
+import { describeCommand, describeReply } from '../debuglog.js';
 import { OOM_MESSAGE } from '../memory.js';
 import { NULL_ARRAY, OK, ReplyError, SimpleString, type Reply } from '../reply.js';
 import type { Store } from '../store.js';
@@ -29,6 +30,8 @@ export interface Logger {
   info(msg: string): void;
   warn(msg: string): void;
   error(msg: string, err?: unknown): void;
+  /** Present only when debug logging is on: every connection and command is logged. */
+  debug?: (msg: string) => void;
 }
 
 export interface RespServerOptions {
@@ -427,7 +430,14 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
         }
         let reply: string;
         try {
-          reply = encode(run(conn, argv), conn.protocol);
+          if (logger?.debug) {
+            const db = conn.db;
+            const result = run(conn, argv);
+            logger.debug(`[resp] client ${conn.id} db${db}: ${describeCommand(argv)} -> ${describeReply(result)}`);
+            reply = encode(result, conn.protocol);
+          } else {
+            reply = encode(run(conn, argv), conn.protocol);
+          }
         } catch (err) {
           if (!(err instanceof RangeError)) throw err;
           reply = encodeError(new ReplyError('reply is too large to send')); // > V8's maximum string length
@@ -493,6 +503,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     clients.set(conn.id, conn);
     stats.totalConnections++;
     stats.connectedClients = clients.size;
+    logger?.debug?.(`[resp] client ${conn.id} connected from ${socket.remoteAddress}:${socket.remotePort}`);
 
     socket.setNoDelay(true);
     socket.setKeepAlive(true, 60_000);
@@ -513,6 +524,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
       pump(conn, parser); // run what was received meanwhile
     });
     socket.on('close', () => {
+      logger?.debug?.(`[resp] client ${conn.id} disconnected`);
       unwatch(conn);
       clients.delete(conn.id);
       stats.connectedClients = clients.size;

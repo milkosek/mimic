@@ -158,7 +158,7 @@ An empty password is a startup error, whether it comes from `--password=`, an `M
 | `--cleanup-interval` | `MIMIC_CLEANUP_INTERVAL_MS` | `100` | How often active expiry runs, in ms |
 | `--cleanup-sample-size` | `MIMIC_CLEANUP_SAMPLE_SIZE` | `20` | Keys checked per expiry batch |
 | `--cleanup-time-budget` | `MIMIC_CLEANUP_TIME_BUDGET_MS` | `5` | Max ms per expiry cycle |
-| `--log-level` | `MIMIC_LOG_LEVEL` | `info` | `silent`, `error`, `warn`, `info` or `debug` |
+| `--log-level` | `MIMIC_LOG_LEVEL` | `info` | `silent`, `error`, `warn`, `info` or `debug`. `debug` logs every connection, command and reply (values truncated, passwords masked), like a lightweight `MONITOR` |
 
 `mimic --help` prints the same list.
 

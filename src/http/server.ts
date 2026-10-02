@@ -30,6 +30,7 @@ import http from 'node:http';
 import { isIPv6 } from 'node:net';
 import { fromText, toText } from '../bytes.js';
 import { execute, type InfoSections } from '../commands.js';
+import { describeCommand, describeReply } from '../debuglog.js';
 import { MapReply, NullArray, ReplyError, SimpleString, VerbatimString, type Reply } from '../reply.js';
 import type { Logger } from '../resp/server.js';
 import type { Database, Store } from '../store.js';
@@ -233,9 +234,14 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
   // Command errors are client errors (like a Redis error reply), not 500s.
   function run(db: Database, argv: string[]): { result: Json } | { error: string } {
     try {
-      return { result: toJson(execute({ store, db, serverInfo }, argv)) };
+      const reply = execute({ store, db, serverInfo }, argv);
+      opts.logger?.debug?.(`[http] db${db.index}: ${describeCommand(argv)} -> ${describeReply(reply)}`);
+      return { result: toJson(reply) };
     } catch (err) {
-      if (err instanceof ReplyError) return { error: err.message };
+      if (err instanceof ReplyError) {
+        opts.logger?.debug?.(`[http] db${db.index}: ${describeCommand(argv)} -> ${describeReply(err)}`);
+        return { error: err.message };
+      }
       throw err;
     }
   }
@@ -338,6 +344,11 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
   }
 
   return http.createServer((req, res) => {
+    if (opts.logger?.debug) {
+      const debug = opts.logger.debug;
+      const t0 = performance.now();
+      res.on('finish', () => debug(`[http] ${req.method} ${req.url} ${res.statusCode} (${(performance.now() - t0).toFixed(1)} ms)`));
+    }
     route(req, res).catch((err: unknown) => {
       if (res.headersSent) {
         res.destroy();
