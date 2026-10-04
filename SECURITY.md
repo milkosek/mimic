@@ -15,21 +15,7 @@ MIMIC is pre-1.0. Only the latest release gets security fixes.
 
 **Please don't open a public issue for a security problem.** Report it privately instead:
 
-<!--
-  TODO (Mateusz): choose one or both and delete the other.
-
-  Option A - GitHub private vulnerability reporting (recommended, free):
-  enable it under the repository's Settings -> Security -> "Private vulnerability reporting",
-  then keep the first bullet below.
-
-  Option B - e-mail: put a dedicated address in the second bullet
-  (an alias you can retire later is better than your main address).
--->
-
 - **GitHub:** use [Report a vulnerability](../../security/advisories/new) on this repository's Security tab.
-- **E-mail:** `[SECURITY CONTACT E-MAIL]` <!-- TODO (Mateusz): fill in, or delete this line -->
-
-<!-- TODO (Mateusz), optional: if you want encrypted reports, add your PGP key fingerprint or a link to it here. -->
 
 Please include:
 
@@ -40,12 +26,10 @@ Please include:
 
 ## What to expect
 
-<!-- TODO (Mateusz): adjust these to what you can really commit to. -->
-
-- **Acknowledgement** within `[7]` days.
-- **First assessment** (whether it's a vulnerability, and how serious) within `[14]` days.
+- **Acknowledgement** within 7 days.
+- **First assessment** (whether it's a vulnerability, and how serious) within 14 days.
 - **A fix or a mitigation** as soon as practical, depending on severity and complexity. You'll be kept informed along the way.
-- **Disclosure:** once a fix is released, the issue is described in the CHANGELOG and, where useful, a GitHub security advisory. Reporters are credited unless they prefer not to be. Please give the project up to `[90]` days before disclosing publicly; that can be shortened by agreement once a fix is out.
+- **Disclosure:** once a fix is released, the issue is described in the CHANGELOG and, where useful, a GitHub security advisory. Reporters are credited unless they prefer not to be. Please give the project up to 90 days before disclosing publicly; that can be shortened by agreement once a fix is out.
 
 As this is a spare-time project, there is no bug bounty.
 

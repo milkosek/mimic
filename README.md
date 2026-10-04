@@ -2,9 +2,11 @@
 
 **MIMIC Is Merely an In-memory Cache.** MIMIC is a small, Redis-compatible, in-memory cache server written in pure Node.js. It's a recursive acronym in the GNU / WINE tradition, and a nod to all good TTRPG adventures. It is not what it looks like it is.
 
-Redis is great, but you can't always install it. **IBM i (PASE)** is the classic example: Node.js runs there, but Redis doesn't. MIMIC fills that gap. It speaks the Redis protocol, so existing Redis clients just connect to it, and it needs nothing beyond Node.js 18 or newer.
+Redis is great, but you can't always install it. **IBM i (PASE)** is the example: Node.js runs there, but Redis doesn't. MIMIC fills that gap. It speaks the Redis protocol, so existing Redis clients just connect to it, and it needs nothing beyond Node.js 18 or newer.
 
 **IMPORTANT NOTE** MIMIC does **NOT** replace Redis and is a far cry of functionality behind the actual Redis. It is merely a substitute for simple use cases where Redis itself can't be installed.
+
+I started this project partly out of noticing the gap for modernizing IBMi as a general purpose server, partly as my programming excercise and finally as my exploration of AI code generation for a nearly greenfield project, while hopefully being useful to someone. 
 
 - **Drop-in for caching.** Standard Redis clients connect unchanged, over RESP2 or RESP3. Tested with redis-cli, ioredis, node-redis and redis-py.
 - **Checked against real Redis.** The test suite sends the same commands to MIMIC and to `redis-server` 7.0 and requires byte-identical replies. That covers more than 500 hand-picked cases, including errors and edge cases, plus a seeded random stream of 4,000 commands over RESP2 and again over RESP3, and 1,500 random glob patterns.
