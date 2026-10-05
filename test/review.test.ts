@@ -42,18 +42,18 @@ before(async () => {
 });
 after(() => d.close());
 
-const resp = (payload: string | Buffer, until: (s: string) => boolean = firstLine) => rawExchange(d.respPort, payload, until);
+const resp = (payload: string | Buffer, until: (s: string) => boolean = firstLine) => rawExchange(d.respPort!, payload, until);
 const httpCmd = (argv: unknown[]) => rawHttp(d.httpPort!, 'POST', '/command', json, JSON.stringify(argv));
 
 describe('release blockers', () => {
   test('1. a client reset while being rejected (maxclients) does not crash the server', async () => {
     const small = await startTestDaemon({ httpPort: null, maxClients: 1 });
     try {
-      const holder = net.connect(small.respPort, '127.0.0.1');
+      const holder = net.connect(small.respPort!, '127.0.0.1');
       await new Promise((r) => holder.once('connect', r));
       await sleep(20);
       for (let i = 0; i < 50; i++) {
-        const s = net.connect(small.respPort, '127.0.0.1');
+        const s = net.connect(small.respPort!, '127.0.0.1');
         s.on('error', () => {});
         s.once('connect', () => s.resetAndDestroy());
       }
@@ -96,7 +96,7 @@ describe('release blockers', () => {
   });
 
   test('3. WATCH notices writes made over HTTP', async () => {
-    const a = net.connect(d.respPort, '127.0.0.1');
+    const a = net.connect(d.respPort!, '127.0.0.1');
     let data = '';
     a.on('data', (c) => (data += c.toString('latin1')));
     const waitFor = async (re: RegExp) => {
@@ -115,13 +115,13 @@ describe('release blockers', () => {
   test('4. unauthenticated clients get Redis-like small limits', async () => {
     const secure = await startTestDaemon({ httpPort: null, password: 'pw' });
     try {
-      const r1 = await rawExchange(secure.respPort, '*11\r\n', firstLine);
+      const r1 = await rawExchange(secure.respPort!, '*11\r\n', firstLine);
       assert.equal(r1, '-ERR Protocol error: unauthenticated multibulk length\r\n');
-      const r2 = await rawExchange(secure.respPort, '*1\r\n$16385\r\n', firstLine);
+      const r2 = await rawExchange(secure.respPort!, '*1\r\n$16385\r\n', firstLine);
       assert.equal(r2, '-ERR Protocol error: unauthenticated bulk length\r\n');
       // Once authenticated, the normal limits apply - even within the same pipeline.
       const big = 'x'.repeat(100_000);
-      const ok = await rawExchange(secure.respPort, Buffer.concat([cmd('AUTH', 'pw'), cmd('SET', 'big', big), cmd('STRLEN', 'big')]), (s) =>
+      const ok = await rawExchange(secure.respPort!, Buffer.concat([cmd('AUTH', 'pw'), cmd('SET', 'big', big), cmd('STRLEN', 'big')]), (s) =>
         s.endsWith(':100000\r\n'),
       );
       assert.equal(ok, '+OK\r\n+OK\r\n:100000\r\n');
@@ -136,7 +136,7 @@ describe('release blockers', () => {
       // A frame that announces 1000 args of 10 KB each and keeps sending: > 1 MB buffered.
       const header = '*1000\r\n';
       const arg = `$10000\r\n${'a'.repeat(10000)}\r\n`;
-      const reply = await rawExchange(capped.respPort, header + arg.repeat(200), () => false);
+      const reply = await rawExchange(capped.respPort!, header + arg.repeat(200), () => false);
       assert.match(reply, /^-ERR Protocol error: client query buffer exceeds limit/);
     } finally {
       await capped.close();
@@ -198,7 +198,7 @@ describe('smaller bugs', () => {
 
   test('writes that change nothing do not invalidate WATCH', async () => {
     await resp(cmd('SET', 'w1', 'v'));
-    const a = net.connect(d.respPort, '127.0.0.1');
+    const a = net.connect(d.respPort!, '127.0.0.1');
     let data = '';
     a.on('data', (c) => (data += c.toString('latin1')));
     const waitFor = async (re: RegExp) => {
@@ -217,7 +217,7 @@ describe('smaller bugs', () => {
 
   test('a watched key that expires before EXEC aborts the transaction (Redis >= 6.0.9)', async () => {
     await resp(cmd('SET', 'w-exp', 'v', 'PX', '40'));
-    const a = net.connect(d.respPort, '127.0.0.1');
+    const a = net.connect(d.respPort!, '127.0.0.1');
     let data = '';
     a.on('data', (c) => (data += c.toString('latin1')));
     a.write(cmd('WATCH', 'w-exp'));
@@ -274,7 +274,7 @@ describe('second review round', () => {
     assert.equal(await resp(cmd('SET', 'big1m', value)), '+OK\r\n');
     const n = 560; // 560 MB of replies: more than V8's maximum string length
     const total = await new Promise<number>((resolve, reject) => {
-      const s = net.connect(d.respPort, '127.0.0.1');
+      const s = net.connect(d.respPort!, '127.0.0.1');
       let bytes = 0;
       const expected = n * (value.length + 12) + 7; // "$1048576\r\n" + value + "\r\n", then "+PONG\r\n"
       s.on('data', (c) => {
@@ -312,7 +312,7 @@ describe('second review round', () => {
 
   test('FLUSHDB only invalidates WATCH for keys that existed', async () => {
     const watchThenFlush = async (setup: Buffer[]): Promise<string> => {
-      const a = net.connect(d.respPort, '127.0.0.1');
+      const a = net.connect(d.respPort!, '127.0.0.1');
       let data = '';
       a.on('data', (c) => (data += c.toString('latin1')));
       a.write(Buffer.concat([cmd('SELECT', '5'), ...setup, cmd('WATCH', 'wf')]));
@@ -345,7 +345,7 @@ describe('second review round', () => {
   test('before AUTH, unknown-command and arity errors come first (Redis order)', async () => {
     const secure = await startTestDaemon({ httpPort: null, password: 'pw' });
     try {
-      const reply = await rawExchange(secure.respPort, Buffer.concat([cmd('FOOBAR'), cmd('GET'), cmd('GET', 'k')]), (s) => s.includes('NOAUTH'));
+      const reply = await rawExchange(secure.respPort!, Buffer.concat([cmd('FOOBAR'), cmd('GET'), cmd('GET', 'k')]), (s) => s.includes('NOAUTH'));
       assert.equal(
         reply,
         "-ERR unknown command 'FOOBAR', with args beginning with: \r\n-ERR wrong number of arguments for 'get' command\r\n-NOAUTH Authentication required.\r\n",
@@ -360,7 +360,7 @@ describe('second review round', () => {
     const before = d.resp.stats.connectedClients;
     const peers: net.Socket[] = [];
     for (const payload of [cmd('QUIT'), Buffer.from('*1\r\n+bad\r\n')]) {
-      const peer = net.connect({ port: d.respPort, host: '127.0.0.1', allowHalfOpen: true }); // never closes its side
+      const peer = net.connect({ port: d.respPort!, host: '127.0.0.1', allowHalfOpen: true }); // never closes its side
       peer.on('error', () => {});
       peer.on('connect', () => peer.write(payload));
       peers.push(peer);

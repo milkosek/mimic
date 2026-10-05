@@ -25,7 +25,7 @@ test('--log-level debug logs connections and every command with its reply', asyn
   const logger = { info() {}, warn() {}, error() {}, debug: (m: string) => lines.push(m) };
   const d = await startTestDaemon({}, logger);
   try {
-    await rawExchange(d.respPort, cmd('SET', 'dbg', 'v'), (s) => s.includes('\r\n'));
+    await rawExchange(d.respPort!, cmd('SET', 'dbg', 'v'), (s) => s.includes('\r\n'));
     await fetch(`http://127.0.0.1:${d.httpPort}/command`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '["GET","dbg"]' });
     await new Promise((r) => setTimeout(r, 50));
     assert.ok(lines.some((l) => /^\[resp\] client \d+ connected from /.test(l)), lines.join('\n'));
@@ -35,4 +35,9 @@ test('--log-level debug logs connections and every command with its reply', asyn
   } finally {
     await d.close();
   }
+});
+
+test('client-supplied text cannot forge log lines', () => {
+  assert.equal(describeCommand(['X\n2026-01-01T00:00:00.000Z [info] FAKE', 'a']), 'X\\x0a2026-01-01T00:00:00.000Z [INFO] FAKE "a"');
+  assert.equal(describeReply(new ReplyError("unknown command 'X\r\nFAKE'")), "(error) ERR unknown command 'X\\x0d\\x0aFAKE'");
 });

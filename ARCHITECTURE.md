@@ -66,7 +66,9 @@ There are three layers:
 | File | Lines | Role |
 |---|---|---|
 | `src/cli.ts` | ~65 | The `mimic` command: load config, start the daemon, handle signals. |
-| `src/daemon.ts` | ~110 | Creates the store, the RESP server and the HTTP server from a config, and shuts them down. |
+| `src/daemon.ts` | ~200 | Creates the store, the RESP server (plain and TLS listeners) and the HTTP server from a config, logs the security summary, and shuts them down. |
+| `src/auth.ts` | ~140 | `PasswordCheck` (keeps only a SHA-256 of the password, constant-time compare), `AuthGuard` (blocks addresses after repeated failed logins), `isLoopback`. Shared by RESP and HTTP. |
+| `src/tls.ts` | ~45 | Reads certificates (PEM or PKCS#12), passphrase and CA into Node TLS options. |
 | `src/config.ts` | ~220 | Flags and `MIMIC_*` environment variables, with validation and the password rules. |
 | `src/logger.ts` | ~25 | Timestamped log lines. `debug` exists only at debug level. |
 | `src/debuglog.ts` | ~55 | Short descriptions of commands and replies for `--log-level debug`. |
@@ -122,6 +124,7 @@ sequenceDiagram
 
 Step by step, with the function names to look for:
 
+0. **The connection is accepted** by `handleConnection()` in `resp/server.ts`, either from the plain listener or from the TLS listener in `daemon.ts`, which hands over the decrypted socket. It refuses the client straight away if protected mode applies (no password, and the client isn't on loopback), if its address is blocked after too many failed logins, or if `--max-clients` is reached. With a password set, it starts the login timer.
 1. **Bytes arrive.** The socket's `'data'` handler in `createRespServer()` (`resp/server.ts`) calls `parser.push(chunk)`, then `pump()`. If the client's earlier replies are still backed up (`conn.waitingForDrain`), `bufferWhileBlocked()` only checks the query-buffer limit and waits for `'drain'`.
 2. **Parsing.** `pump()` calls `parser.next()` until it returns `undefined` (meaning more bytes are needed). `RespParser` keeps partial frames between chunks, so a command split across TCP packets is fine. It returns an `argv` of binary strings, or throws `ProtocolError` for malformed input. Before AUTH it applies Redis' smaller limits.
 3. **The HTTP probe check.** If the first word is `POST` or a `Host:` header, the connection is dropped silently. That's how Redis blocks cross-protocol attacks from web pages.
@@ -234,7 +237,7 @@ classDiagram
 
 **`Connection`** holds one client's state: the selected database, protocol version (2 or 3), whether it's authenticated, its name, the `MULTI` queue, the watched keys, and flags for closing and backpressure. `describe()` produces the `CLIENT INFO` line.
 
-**Authentication** (`Connection.authenticate()`) follows Redis' rules for the `default` user: `AUTH password` and `AUTH default password`, `HELLO … AUTH`, `WRONGPASS` for anything else, and a special message when no password is configured. The password is compared with `safeEqual()` (constant time).
+**Authentication** (`Connection.authenticate()`) follows Redis' rules for the `default` user: `AUTH password` and `AUTH default password`, `HELLO … AUTH`, `WRONGPASS` for anything else, and a special message when no password is configured. The server holds only a `PasswordCheck` (`auth.ts`): a SHA-256 of the password, compared in constant time. Each `WRONGPASS` is reported to the shared `AuthGuard`; when that blocks the client's address, the connection is closed after the reply.
 
 **Transactions.** `MULTI` starts a queue. Commands are checked (existence, arity, memory) when they're queued; an error marks the transaction as failed, and `EXEC` then answers `EXECABORT`. `exec()` runs the queue in one go (atomic, see [Core ideas](#core-ideas)).
 
@@ -251,7 +254,14 @@ Most of these exist because a review round found a way to crash or stall the ser
 
 | Limit | Where | Protects against |
 |---|---|---|
+| Protected mode: no password → loopback clients only | `resp/server.ts`, `http/server.ts` | A cache exposed to the network by accident |
+| Failed logins counted per address; blocked for 60 s after `--auth-max-failures` | `auth.ts` (`AuthGuard`), used by both servers | Password guessing |
+| Login within `--auth-timeout` seconds | `resp/server.ts` (`handleConnection()`) | Idle unauthenticated connections taking slots |
 | Before AUTH: 10 arguments, 16 KB each | `resp/parser.ts` (`UNAUTHENTICATED_LIMITS`) | Unauthenticated clients making the server buffer a lot of data |
+| Before AUTH: at most 256 KB of buffered input | `resp/server.ts` (`queryBufferLimit()`) | An unauthenticated client that sends without reading its `-NOAUTH` replies |
+| `--disable-commands` | `commands.ts` (`resolveCommand()`, `lookup()`) | Applications running commands they never need (`FLUSHALL`, `KEYS`…) |
+| JSON nesting depth (64) | `http/server.ts` (`checkJson()`) | Stack overflow when a nested value is stored as JSON text |
+| HTTP timeouts and connection cap | `http/server.ts` | Slow or idle HTTP clients holding connections |
 | `--max-bulk-bytes` (64 MB per value) | `resp/parser.ts` | A single huge value |
 | `--max-query-buffer` (1 GB per client) | `resp/server.ts` | A client that sends without ever reading |
 | Replies written in 64 KB pieces | `resp/server.ts` (`pump()`) | Replies larger than V8's maximum string length (~512 MB) |
@@ -261,6 +271,8 @@ Most of these exist because a review round found a way to crash or stall the ser
 | Seeded bucket hash | `keyspace.ts` | Keys chosen to collide on purpose |
 | HTTP body limit, JSON Content-Type, Origin, Sec-Fetch-Site and Host checks | `http/server.ts` | Web pages writing to or reading from the cache |
 | `POST`/`Host:` on the RESP port drops the connection | `resp/server.ts` (`isHttpProbe()`) | Cross-protocol attacks from browsers |
+| Own-property lookups for user-supplied names | `commands.ts` (`lookup()`, CONFIG GET) | Names like `__proto__` or `constructor` reaching `Object.prototype` |
+| Control characters escaped in logged client text | `debuglog.ts` | Forged log lines |
 
 [SECURITY.md](SECURITY.md) covers the security model and the known gaps.
 

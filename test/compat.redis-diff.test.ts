@@ -126,7 +126,7 @@ describe('MIMIC vs redis-server', { skip: hasRedis ? false : 'redis-server not i
   /** Run `commands` on fresh connections to both servers and compare reply by reply. */
   async function compare(name: string, commands: (string[] | Buffer | string)[], setup: string[][] = []): Promise<void> {
     const r = new Conn(redisPort);
-    const m = new Conn(mimic.respPort);
+    const m = new Conn(mimic.respPort!);
     try {
       for (const c of [['FLUSHALL'], ...setup]) {
         await r.send(cmd(...c));
@@ -196,7 +196,7 @@ describe('MIMIC vs redis-server', { skip: hasRedis ? false : 'redis-server not i
     setup.push(['HSET', 'user:h', 'f', 'v']);
     for (const pattern of ['*', 'user:*', 'user:?', 'user:[12]', 'user:[^1]*', 'a\\*b', 'a?b', '*:1*', 'nomatch*', '[a-o]*', 'user:[12', 'user:[]', 'a\\[*', '[z-a]*', 'user:\\1', '*?*?*?*?*?*?*?*?x', 'x[^]', '\\', 'user:[1-]']) {
       const r = new Conn(redisPort);
-      const m = new Conn(mimic.respPort);
+      const m = new Conn(mimic.respPort!);
       for (const c of [['FLUSHALL'], ...setup]) {
         await r.send(cmd(...c));
         await m.send(cmd(...c));
@@ -294,7 +294,7 @@ describe('MIMIC vs redis-server', { skip: hasRedis ? false : 'redis-server not i
   test('WATCH is per database', async () => {
     for (const [watchDb, writeDb] of [['0', '1'], ['1', '1']]) {
       const results: string[][] = [];
-      for (const port of [redisPort, mimic.respPort]) {
+      for (const port of [redisPort, mimic.respPort!]) {
         const a = new Conn(port);
         const b = new Conn(port);
         const out: string[] = [];
@@ -342,7 +342,7 @@ describe('MIMIC vs redis-server', { skip: hasRedis ? false : 'redis-server not i
       () => ['MULTI'], () => ['EXEC'], () => ['DISCARD'], () => ['WATCH', key()], () => ['UNWATCH'],
     ];
     const r = new Conn(redisPort);
-    const m = new Conn(mimic.respPort);
+    const m = new Conn(mimic.respPort!);
     try {
       await r.send(cmd('FLUSHALL'));
       await m.send(cmd('FLUSHALL'));
@@ -372,7 +372,7 @@ describe('MIMIC vs redis-server', { skip: hasRedis ? false : 'redis-server not i
     while (keys.size < 40) keys.add(Array.from({ length: 1 + rnd(5) }, () => alphabet[rnd(alphabet.length)]).join(''));
     const tokens = ['a', 'b', 'c', '-', '^', ']', '[', '*', '?', '\\', '[a-c]', '[^a]', '[]', '[c-a]', '\\*', '\\['];
     const r = new Conn(redisPort);
-    const m = new Conn(mimic.respPort);
+    const m = new Conn(mimic.respPort!);
     try {
       for (const c of [cmd('FLUSHALL'), ...[...keys].map((k) => cmd('SET', k, '1'))]) {
         await r.send(c);
@@ -441,7 +441,7 @@ describe('MIMIC vs redis-server', { skip: hasRedis ? false : 'redis-server not i
 
   test('an HTTP request on the RESP port is dropped silently', () =>
     compare('http', ['POST / HTTP/1.1\r\nHost: localhost\r\n\r\nSET pwned 1\r\n']).then(async () => {
-      const c = new Conn(mimic.respPort);
+      const c = new Conn(mimic.respPort!);
       assert.equal(await c.send(cmd('EXISTS', 'pwned')), ':0\r\n');
       c.close();
     }));
@@ -464,7 +464,7 @@ describe('MIMIC vs redis-server', { skip: hasRedis ? false : 'redis-server not i
         [cmd('AUTH', pw), Buffer.concat([cmd('SET', 'big', 'x'.repeat(20000)), cmd('STRLEN', 'big')]), cmd('STRLEN', 'big')],
       ]) {
         const r = new Conn(redisPort);
-        const m = new Conn(secure.respPort);
+        const m = new Conn(secure.respPort!);
         for (const p of script) {
           const [a, b] = [await r.send(p), await m.send(p)];
           assert.equal(b, a, `auth: ${JSON.stringify(p.toString().slice(0, 60))}\n  redis: ${JSON.stringify(a)}\n  mimic: ${JSON.stringify(b)}`);

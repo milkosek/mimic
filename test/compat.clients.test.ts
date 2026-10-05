@@ -3,6 +3,8 @@
 
 import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { after, before, describe, test } from 'node:test';
 import { Redis } from 'ioredis';
@@ -19,7 +21,7 @@ after(() => d.close());
 describe('ioredis', () => {
   let r: Redis;
   before(async () => {
-    r = new Redis({ port: d.respPort, host: '127.0.0.1', password: 'pw', connectionName: 'ioredis-test', lazyConnect: true });
+    r = new Redis({ port: d.respPort!, host: '127.0.0.1', password: 'pw', connectionName: 'ioredis-test', lazyConnect: true });
     await r.connect(); // includes the INFO ready check
   });
   after(() => r.quit());
@@ -85,7 +87,7 @@ describe('ioredis', () => {
 describe('node-redis', () => {
   let c: ReturnType<typeof createClient>;
   before(async () => {
-    c = createClient({ socket: { port: d.respPort, host: '127.0.0.1' }, password: 'pw', name: 'node-redis-test' });
+    c = createClient({ socket: { port: d.respPort!, host: '127.0.0.1' }, password: 'pw', name: 'node-redis-test' });
     c.on('error', () => {});
     await c.connect();
   });
@@ -137,7 +139,7 @@ describe('node-redis', () => {
 // Must be async: the server runs in this same process, a sync child would deadlock it.
 const execFileAsync = promisify(execFile);
 async function redisCli(...args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync('redis-cli', ['-p', String(d.respPort), '-a', 'pw', '--no-auth-warning', ...args]);
+  const { stdout } = await execFileAsync('redis-cli', ['-p', String(d.respPort!), '-a', 'pw', '--no-auth-warning', ...args]);
   return stdout.trim();
 }
 
@@ -161,5 +163,34 @@ describe('redis-cli', { skip: hasRedisCli ? false : 'redis-cli not installed' },
     for (let i = 0; i < 50; i++) await redisCli('SET', `cli:scan:${i}`, 'x');
     const keys = (await redisCli('--scan', '--pattern', 'cli:scan:*')).split('\n');
     assert.equal(new Set(keys).size, 50);
+  });
+});
+
+describe('TLS with real clients', () => {
+  const fixture = (name: string): string => fileURLToPath(new URL(`../../test/fixtures/tls/${name}`, import.meta.url));
+  let t: Daemon;
+  before(async () => {
+    t = await startTestDaemon({ port: null, httpPort: null, password: 'pw-over-tls', tlsPort: 0, tlsCertFile: fixture('server.crt'), tlsKeyFile: fixture('server.key') });
+  });
+  after(() => t.close());
+
+  test('ioredis', async () => {
+    const r = new Redis({ port: t.respTlsPort!, host: '127.0.0.1', password: 'pw-over-tls', tls: { ca: readFileSync(fixture('ca.crt')), servername: 'localhost' }, lazyConnect: true });
+    await r.connect();
+    assert.equal(await r.set('tls:io', 'v'), 'OK');
+    assert.equal(await r.get('tls:io'), 'v');
+    await r.quit();
+  });
+
+  test('node-redis', async () => {
+    const c = createClient({ url: `rediss://:pw-over-tls@localhost:${t.respTlsPort}`, socket: { tls: true, ca: readFileSync(fixture('ca.crt')) } });
+    await c.connect();
+    assert.equal(await c.get('tls:io'), 'v');
+    await c.quit();
+  });
+
+  test('redis-cli --tls', { skip: hasRedisCli ? false : 'redis-cli not installed' }, async () => {
+    const { stdout } = await execFileAsync('redis-cli', ['--tls', '--cacert', fixture('ca.crt'), '-p', String(t.respTlsPort), '-a', 'pw-over-tls', '--no-auth-warning', 'GET', 'tls:io']);
+    assert.equal(stdout.trim(), 'v');
   });
 });

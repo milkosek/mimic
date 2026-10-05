@@ -45,7 +45,7 @@ before(async () => {
 after(() => d.close());
 
 const resp = (payload: string | Buffer, until: (s: string) => boolean = (s) => s.includes('\r\n')) =>
-  rawExchange(d.respPort, payload, until);
+  rawExchange(d.respPort!, payload, until);
 
 describe('pipelining and backpressure', () => {
   test('a client that writes its whole pipeline before reading anything does not deadlock', async () => {
@@ -55,7 +55,7 @@ describe('pipelining and backpressure', () => {
     const payload = Buffer.concat(Array.from({ length: n }, () => one));
     const reply = `$256\r\n${'v'.repeat(256)}\r\n`.length;
     const received = await new Promise<number>((resolve, reject) => {
-      const s = net.connect(d.respPort, '127.0.0.1');
+      const s = net.connect(d.respPort!, '127.0.0.1');
       let bytes = 0;
       const timer = setTimeout(() => (s.destroy(), reject(new Error(`stuck: ${bytes} bytes received`))), 30_000);
       s.pause(); // like a synchronous client: no reading until everything is written

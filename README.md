@@ -63,10 +63,11 @@ TypeScript is pinned to 6.x on purpose. TypeScript 7's native compiler ships per
 
 ## Running on IBM i
 
-1. **Install Node.js** (open-source RPMs, via ACS or `yum`). Pick a supported LTS release:
+1. **Install Node.js** (open-source RPMs, via ACS or `yum`). MIMIC runs on Node.js 18 or newer, but pick a release that still gets security updates (Node.js 22 or 24 at the time of writing; Node.js 18 and 20 have reached end-of-life):
 
    ```sh
-   yum install nodejs20        # or a newer LTS if your system offers it
+   yum list available 'nodejs*'   # see which versions your repository offers
+   yum install nodejs22           # or the newest LTS listed
    ```
 
 2. **Put MIMIC in the IFS**, e.g. `/home/MYUSER/mimic` (clone and build it there, or copy a build from your PC).
@@ -91,7 +92,7 @@ TypeScript is pinned to 6.x on purpose. TypeScript 7's native compiler ships per
 
 Tips:
 
-- Keep the default `127.0.0.1` bind if only jobs on the same partition use the cache. If other LPARs or PCs need it, set `MIMIC_HOST=0.0.0.0` **and** a password.
+- Keep the default `127.0.0.1` bind if only jobs on the same partition use the cache. If other LPARs or PCs need it, see [Accepting connections from other machines](#accepting-connections-from-other-machines): a password, and TLS.
 - Several applications can share one MIMIC without key clashes by each using its own database: `db: 2` in the client, `SELECT 2`, or `?db=2` over HTTP.
 - Log lines go to stdout/stderr with ISO timestamps. Service Commander keeps them in its log file.
 - `SIGTERM` or `SIGINT` (for example `sc stop`) shuts down cleanly.
@@ -143,12 +144,23 @@ An empty password is a startup error, whether it comes from `--password=`, an `M
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
-| `--host` | `MIMIC_HOST` | `127.0.0.1` | RESP bind address |
-| `--port` | `MIMIC_PORT` | `6379` | RESP port |
-| `--http-host` | `MIMIC_HTTP_HOST` | same as host | HTTP bind address |
+| `--host` | `MIMIC_HOST` | `127.0.0.1` | RESP bind address (plain and TLS) |
+| `--port` | `MIMIC_PORT` | `6379` | RESP port, `off` to accept only TLS |
+| `--http-host` | `MIMIC_HTTP_HOST` | `127.0.0.1` | HTTP bind address. It does **not** follow `--host`: exposing the HTTP API is a separate decision |
 | `--http-port` | `MIMIC_HTTP_PORT` | `6380` | HTTP port, `off` to disable |
-| `--password` | `MIMIC_PASSWORD` | unset | Requires `AUTH` (RESP) and `Authorization: Bearer` (HTTP) |
-| `--password-file` | `MIMIC_PASSWORD_FILE` | unset | Read the password from a file |
+| `--password` | `MIMIC_PASSWORD` | unset | Requires `AUTH` (RESP) and `Authorization: Bearer` (HTTP). Plain, or `sha256:<hex>` (see [Passwords](#passwords)) |
+| `--password-file` | `MIMIC_PASSWORD_FILE` | unset | Read the password (or its `sha256:` hash) from a file |
+| `--protected-mode` | `MIMIC_PROTECTED_MODE` | `yes` | Without a password, accept only clients on this machine (loopback). As in Redis |
+| `--auth-timeout` | `MIMIC_AUTH_TIMEOUT` | `10` | With a password: close connections that haven't authenticated after N seconds (0 = never) |
+| `--auth-max-failures` | `MIMIC_AUTH_MAX_FAILURES` | `10` | Block an address for 60 s after N failed logins within 60 s, over RESP and HTTP together (0 = never). Loopback is never blocked |
+| `--disable-commands` | `MIMIC_DISABLE_COMMANDS` | none | Comma-separated commands to refuse as if unknown, e.g. `FLUSHALL,FLUSHDB,KEYS` |
+| `--tls-port` | `MIMIC_TLS_PORT` | off | RESP over TLS on this port |
+| `--tls-cert-file`, `--tls-key-file` | `MIMIC_TLS_CERT_FILE`, `MIMIC_TLS_KEY_FILE` | unset | Server certificate and key (PEM) |
+| `--tls-pfx-file` | `MIMIC_TLS_PFX_FILE` | unset | Certificate and key as one PKCS#12 file (`.p12`/`.pfx`, e.g. exported from IBM i DCM), instead of the two above |
+| `--tls-key-pass-file` | `MIMIC_TLS_KEY_PASS_FILE` | unset | File holding the passphrase of the key or PKCS#12 file |
+| `--tls-ca-cert-file` | `MIMIC_TLS_CA_CERT_FILE` | unset | CA certificate(s) for client certificates (mutual TLS) |
+| `--tls-auth-clients` | `MIMIC_TLS_AUTH_CLIENTS` | `yes` with a CA file, else `no` | Require (`yes`), accept (`optional`) or ignore (`no`) client certificates |
+| `--http-tls` | `MIMIC_HTTP_TLS` | `no` | Serve the HTTP API over HTTPS, with the same certificate |
 | `--max-clients` | `MIMIC_MAX_CLIENTS` | `10000` | Max concurrent RESP connections |
 | `--databases` | `MIMIC_DATABASES` | `16` | Number of databases (`SELECT 0` … `N-1`) |
 | `--idle-timeout` | `MIMIC_IDLE_TIMEOUT` | `0` | Close idle RESP clients after N seconds (0 = never) |
@@ -163,7 +175,44 @@ An empty password is a startup error, whether it comes from `--password=`, an `M
 | `--cleanup-time-budget` | `MIMIC_CLEANUP_TIME_BUDGET_MS` | `5` | Max ms per expiry cycle |
 | `--log-level` | `MIMIC_LOG_LEVEL` | `info` | `silent`, `error`, `warn`, `info` or `debug`. `debug` logs every connection, command and reply (values truncated, passwords masked), like a lightweight `MONITOR` |
 
-`mimic --help` prints the same list.
+`mimic --help` prints the same list. Numeric options are range-checked: a value that makes no sense (an idle timeout of 30 days, a cleanup budget of 0 ms) is a startup error, not a surprise later.
+
+### Passwords
+
+Clients authenticate with `AUTH <password>` (or `HELLO 3 AUTH default <password>`) over RESP, and with `Authorization: Bearer <password>` over HTTP.
+
+- **Use a long random password**, for example `node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"`. MIMIC warns about passwords shorter than 16 characters.
+- **Keep it in a file** that only MIMIC's user can read (`chmod 600`), and point `--password-file` or `MIMIC_PASSWORD_FILE` at it. MIMIC warns if the file can be read by others, or if `--password` is used on the command line (other users can see it in the process list).
+- **The file can hold a hash instead of the password,** so whoever can read MIMIC's configuration still doesn't learn it. Create the hash with `mimic --hash-password`, which reads the password from standard input:
+
+  ```sh
+  printf '%s' 'the-long-random-password' | node dist/cli.js --hash-password > /home/mimic/.mimic-pass
+  # the file now holds sha256:9f86d08...; clients still send the password itself
+  ```
+
+  MIMIC never keeps the plain password in memory either way: it is hashed at startup, and every attempt is compared hash to hash, in constant time.
+- **Guessing is slowed down:** after `--auth-max-failures` wrong passwords (default 10) within a minute, an address is blocked for a minute, on RESP and HTTP alike, and every block is logged. Clients on this machine (loopback) are never blocked, so one misconfigured local job can't lock out the rest.
+- **Connections must log in promptly:** with a password set, a connection that hasn't authenticated within `--auth-timeout` seconds (default 10) is closed.
+- Changing the password means restarting MIMIC (there is no `CONFIG SET`).
+
+### Accepting connections from other machines
+
+By default MIMIC only listens on `127.0.0.1`. To let other LPARs, PCs or servers in:
+
+1. **Set a password.** Without one, protected mode refuses every client that isn't on this machine, with a `-DENIED` error that says why.
+2. **Use TLS**, so the password and the data aren't readable on the network:
+
+   ```sh
+   node dist/cli.js --host 0.0.0.0 --password-file /home/mimic/.mimic-pass \
+     --port off --tls-port 6390 --tls-pfx-file /home/mimic/mimic.p12 --tls-key-pass-file /home/mimic/.p12-pass
+   ```
+
+   On IBM i, the certificate can come from Digital Certificate Manager: export it with its private key as a PKCS#12 file. Clients connect with TLS (`rediss://` URLs, `tls: {...}` in ioredis, `redis-cli --tls`).
+3. **Optionally require client certificates** with `--tls-ca-cert-file`: then only clients holding a certificate signed by that CA can even start a session.
+4. **Restrict who can reach the port**: bind to one interface address rather than `0.0.0.0`, and use IP packet filtering or a firewall.
+5. **Keep the HTTP API local** unless you need it remotely. It stays on `127.0.0.1` even when `--host` changes; if you do expose it with `--http-host`, add `--http-tls`.
+
+At startup MIMIC logs one `security:` line summarising all of this, and warns about risky combinations (no password on a network address, plain text on a network address, running as root/QSECOFR).
 
 ### Memory
 
@@ -235,6 +284,7 @@ What is different:
 - **Malformed frames:** MIMIC is a little stricter than Redis. For example, a bulk string not followed by CRLF is a protocol error, where Redis skips two bytes. Well-formed clients never notice.
 - **Glob ranges with bytes ≥ 0x80** (such as `[a-\xff]`) compare bytes as unsigned. Redis on x86 compares them as signed `char`, so results can differ for such ranges; Redis on ARM agrees with MIMIC.
 - **`INFO`** reports `redis_version:7.0.0` so client feature detection works, plus `mimic_version`. `avg_ttl` is always 0.
+- **Security extras Redis doesn't have:** blocking addresses after repeated failed logins, the login timeout, and the 256 KB input cap for unauthenticated clients. The protected-mode `-DENIED` message is worded for MIMIC. `--disable-commands` plays the role of Redis' `rename-command CMD ""`; there is no renaming.
 
 ## How it works
 
@@ -272,6 +322,8 @@ const { config } = loadConfig([], process.env);
 const daemon = await startDaemon({ ...config, port: 6379, httpPort: null });
 ```
 
+`createRespServer()` and `createHttpServer()` default to the same protections as the daemon: protected mode on, a 10 s login timeout, and blocking after 10 failed logins a minute.
+
 ## Development
 
 ```bash
@@ -304,7 +356,9 @@ src/
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md). It also describes the security model, the known limitations and a deployment checklist (including IBM i).
 
-- By default MIMIC binds to `127.0.0.1` and requires no password. If it listens on anything else without a password, it logs a warning.
+- By default MIMIC binds to `127.0.0.1` and requires no password. Without a password, **protected mode** refuses clients that aren't on this machine, even if MIMIC listens on other addresses. See [Accepting connections from other machines](#accepting-connections-from-other-machines) for passwords, TLS and client certificates.
+- **Logins are protected:** only a hash of the password is kept; wrong passwords are counted per address, which is blocked for a minute after too many; connections that don't log in within 10 s are closed; an unauthenticated client can't make MIMIC hold more than 256 KB of its input. See [Passwords](#passwords).
+- **Commands can be switched off** with `--disable-commands`, for example `FLUSHALL,FLUSHDB,KEYS` for applications that should never wipe or scan the cache.
 - **Web pages can't use your cache.** A page open in a browser on the same machine could otherwise reach `localhost`. MIMIC blocks that in three ways:
   - **HTTP API:** request bodies must be `application/json`, which browsers can't send cross-origin without a CORS preflight, and MIMIC never grants one. Requests carrying an `Origin` header are refused (403) unless the origin is listed in `--http-allowed-origins`.
   - **Browser GETs:** a cross-site request marked `Sec-Fetch-Site` is refused, including an `<img src="http://127.0.0.1:6380/keys">` tag. Very old browsers that don't send that header (Safari before 16.4) can still make MIMIC run a `GET` route. They can't read the result, and patterns can't hang the server, but if such browsers on the same machine might visit untrusted sites, set a password.
@@ -315,7 +369,9 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md). It also describes the
 - **Replies are streamed with backpressure.** A pipeline whose replies add up to more than V8's maximum string length (about 512 MB) is sent in 64 KB pieces. While a client isn't reading, MIMIC stops running its commands.
 - **`KEYS`/`SCAN` patterns can't hang the server.** Matching is a port of Redis' `stringmatchlen()`, including the CVE-2022-36021 protections, and uses no regular expressions. Oversized numeric arguments are rejected before any big-number parsing.
 - Passwords are compared in constant time. Prefer `MIMIC_PASSWORD_FILE` over `--password`, because command lines are visible to other users. An empty password, from any source, stops startup.
-- There is no TLS. If traffic crosses a network you don't trust, tunnel it (for example with SSH), or keep MIMIC on the same host as its clients.
+- **TLS** is available for RESP (`--tls-port`) and HTTP (`--http-tls`), with optional client certificates.
+- HTTP replies carry `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`; slow or idle HTTP clients are cut off (10 s for headers, 30 s per request), and at most 1,000 HTTP connections are open at once.
+- Client-supplied text is escaped in debug logs, so it can't forge log lines.
 
 ## Roadmap
 

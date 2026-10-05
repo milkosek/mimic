@@ -44,6 +44,8 @@ export interface CommandContext {
   conn?: ConnectionHandle;
   /** Extra INFO sections supplied by the server (clients, stats, ports). */
   serverInfo?: () => InfoSections;
+  /** Commands disabled with --disable-commands (upper case): they behave as unknown. */
+  disabled?: ReadonlySet<string>;
 }
 
 export interface CommandSpec {
@@ -342,7 +344,7 @@ export const COMMANDS: Record<string, CommandSpec> = {
     ctx.store.swapdb(first, second);
     return OK;
   }),
-  COMMAND: spec(-1, [], NOKEYS, (_, a) => commandReply(a)),
+  COMMAND: spec(-1, [], NOKEYS, (ctx, a) => commandReply(a, ctx.disabled)),
   CONFIG: spec(-2, ['admin'], NOKEYS, (ctx, a) => {
     const sub = a[0]!.toUpperCase();
     if (sub === 'GET') {
@@ -353,7 +355,9 @@ export const COMMANDS: Record<string, CommandSpec> = {
       const out = new Map<string, string>();
       for (const p of a.slice(1)) {
         if (!/[*?[]/.test(p)) {
-          const value = params[p.toLowerCase()];
+          // Own properties only: "constructor" or "__proto__" must not reach Object.prototype.
+          const name = p.toLowerCase();
+          const value = Object.hasOwn(params, name) ? params[name] : undefined;
           if (value !== undefined) out.set(p, value);
         } else {
           for (const [k, v] of Object.entries(params)) if (globMatch(p, k, true)) out.set(k, v);
@@ -465,9 +469,12 @@ export const COMMANDS: Record<string, CommandSpec> = {
         return OK;
       case 'SETINFO': {
         const attr = a[1]!.toUpperCase();
+        if (attr !== 'LIB-NAME' && attr !== 'LIB-VER') throw new ReplyError(`Unrecognized option '${a[1]}'`);
+        // Same rule as Redis 7.2 (and CLIENT SETNAME): printable ASCII, no spaces.
+        // Without it, a value with a newline could forge lines in CLIENT LIST.
+        if (/[^!-~]/.test(a[2]!)) throw new ReplyError(`${attr.toLowerCase()} cannot contain spaces, newlines or special characters.`);
         if (attr === 'LIB-NAME') conn.libName = a[2]!;
-        else if (attr === 'LIB-VER') conn.libVer = a[2]!;
-        else throw new ReplyError(`Unrecognized option '${a[1]}'`);
+        else conn.libVer = a[2]!;
         return OK;
       }
       case 'INFO':
@@ -621,27 +628,48 @@ function describeCommand(name: string, s: CommandSpec): Reply {
   return [name.toLowerCase(), s.arity, s.flags.map((f) => new SimpleString(f)), ...s.keys];
 }
 
-// COMMAND, COMMAND COUNT, COMMAND INFO name..., COMMAND LIST, COMMAND DOCS
-function commandReply(a: string[]): Reply {
-  if (a.length === 0) return Object.entries(COMMANDS).map(([n, s]) => describeCommand(n, s));
+/** A command by name (any case), unless it doesn't exist or is disabled. */
+function lookup(name: string, disabled?: ReadonlySet<string>): CommandSpec | undefined {
+  const upper = name.toUpperCase();
+  if (!Object.hasOwn(COMMANDS, upper) || disabled?.has(upper)) return undefined;
+  return COMMANDS[upper];
+}
+
+// COMMAND, COMMAND COUNT, COMMAND INFO name..., COMMAND LIST, COMMAND DOCS.
+// Disabled commands are left out, as with Redis' rename-command.
+function commandReply(a: string[], disabled?: ReadonlySet<string>): Reply {
+  const all = Object.entries(COMMANDS).filter(([n]) => !disabled?.has(n));
+  if (a.length === 0) return all.map(([n, s]) => describeCommand(n, s));
   const sub = a[0]!.toUpperCase();
-  if (sub === 'COUNT') return Object.keys(COMMANDS).length;
-  if (sub === 'LIST') return Object.keys(COMMANDS).map((n) => n.toLowerCase());
+  if (sub === 'COUNT') return all.length;
+  if (sub === 'LIST') return all.map(([n]) => n.toLowerCase());
   if (sub === 'DOCS') return []; // no docs; redis-cli falls back to its built-in hints
   if (sub === 'INFO') {
     return a.slice(1).map((n) => {
-      const s = COMMANDS[n.toUpperCase()];
+      const s = lookup(n, disabled);
       return s ? describeCommand(n, s) : null;
     });
   }
   throw new ReplyError(`unknown subcommand '${a[0]}'. Try COMMAND HELP.`);
 }
 
+/** Commands that can't be disabled: without them, clients couldn't authenticate or disconnect. */
+export const ALWAYS_ENABLED = new Set(['AUTH', 'HELLO', 'QUIT', 'RESET', 'PING']);
+
+/** Check a --disable-commands list; returns an error message, or null if it's fine. */
+export function checkDisabledCommands(names: readonly string[]): string | null {
+  for (const n of names) {
+    if (!Object.hasOwn(COMMANDS, n)) return `--disable-commands: unknown command ${n}`;
+    if (ALWAYS_ENABLED.has(n)) return `--disable-commands: ${n} can't be disabled`;
+  }
+  return null;
+}
+
 /** Look up a command and validate its arity. Throws the same errors Redis does. */
-export function resolveCommand(argv: string[]): CommandSpec {
+export function resolveCommand(argv: string[], disabled?: ReadonlySet<string>): CommandSpec {
   if (argv.length === 0) throw new ReplyError('empty command');
   const name = argv[0]!;
-  const cmd = COMMANDS[name.toUpperCase()];
+  const cmd = lookup(name, disabled);
   if (!cmd) {
     // Same text as Redis 7: each argument quoted and followed by a space, 128 chars in total.
     let args = '';
@@ -670,7 +698,7 @@ export function commandKeys(spec: CommandSpec, argv: string[]): string[] {
  * Throws ReplyError for anything the client should see as an error reply.
  */
 export function execute(ctx: CommandContext, argv: string[]): Reply {
-  const spec = resolveCommand(argv);
+  const spec = resolveCommand(argv, ctx.disabled);
   checkMemory(ctx, spec, argv);
   return spec.run(ctx, argv.slice(1));
 }

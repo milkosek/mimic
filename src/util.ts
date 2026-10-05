@@ -4,7 +4,6 @@
 // Copyright (c) 2009-2012, Salvatore Sanfilippo, BSD 3-Clause license;
 // see NOTICE and licenses/redis-BSD-3-Clause.txt.
 
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { notInteger, ReplyError } from './reply.js';
 
 // Redis' string2ll(): an optional '-', then either "0" or digits without a
@@ -158,11 +157,4 @@ export function normaliseRange(start: number, stop: number, length: number): [nu
   const s = Math.max(start < 0 ? length + start : start, 0);
   const e = Math.min(stop < 0 ? length + stop : stop, length - 1);
   return [s, e];
-}
-
-/** Constant-time comparison for passwords/tokens (compares SHA-256 digests so lengths never leak). */
-export function safeEqual(given: string, expected: string): boolean {
-  const a = createHash('sha256').update(given, 'latin1').digest();
-  const b = createHash('sha256').update(expected, 'latin1').digest();
-  return timingSafeEqual(a, b);
 }

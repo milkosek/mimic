@@ -107,6 +107,33 @@ Hard edge cases from the next review round, fixed where the fix was simpler than
 - Credit for ported Redis code: `NOTICE` now lists the functions ported from Redis 7.0 (BSD 3-Clause), the Redis license is included in `licenses/`, and the ported files say so in their headers.
 - Left as documented differences: expire times beyond 2^53 ms are capped, and multi-million-key heaps see occasional V8 pauses of a few hundred ms.
 
+Security hardening before the first release (after an independent review of the whole code base):
+
+- **TLS:** RESP over TLS (`--tls-port`) and HTTPS (`--http-tls`), TLS 1.2 or newer. Certificates as PEM files or one PKCS#12 file (as exported from IBM i Digital Certificate Manager), with a passphrase file. Client certificates can be required (`--tls-ca-cert-file`, `--tls-auth-clients`). Plain RESP can be turned off (`--port off`). Tested with ioredis, node-redis and `redis-cli --tls`.
+- **Protected mode** (`--protected-mode`, on by default), as in Redis: without a password, only clients on this machine are accepted, on RESP and HTTP.
+- **The HTTP API binds to `127.0.0.1` by default**, whatever `--host` is. *This changes behaviour:* if you relied on `--host 0.0.0.0` exposing HTTP too, add `--http-host`.
+- **Login protection:**
+  - failed logins are counted per address over RESP and HTTP together; after `--auth-max-failures` (10) within a minute the address is blocked for a minute, and it's logged. Loopback is never blocked;
+  - connections must authenticate within `--auth-timeout` (10 s);
+  - an unauthenticated client can't make MIMIC hold more than 256 KB of its input (it could hold up to `--max-query-buffer`, 1 GB, before);
+  - only a SHA-256 hash of the password is kept, and the password can be configured as `sha256:<hex>`; `mimic --hash-password` makes one;
+  - the HTTP token must use the `Bearer` scheme (a bare token was accepted);
+  - passwords with non-ASCII characters (such as `zażółć`) were always rejected, because the configured password was compared as text and the client's as bytes; both are now compared as UTF-8 bytes;
+  - warnings for short passwords, readable password files and `--password` on the command line.
+- **`--disable-commands`**, e.g. `FLUSHALL,FLUSHDB,KEYS`: disabled commands behave as unknown over RESP and HTTP, in `MULTI` and in `COMMAND` output.
+- **Fixed:**
+  - `CONFIG GET constructor` / `__proto__` reached `Object.prototype` and caused an internal error;
+  - `CLIENT SETINFO` accepted newlines, which could forge lines in `CLIENT LIST`. It now only accepts printable characters, like `SETNAME` and Redis 7.2;
+  - debug logs could be forged with control characters in a command name;
+  - `/pipeline` could return internal error messages;
+  - deeply nested JSON gave a 500 (now a 400);
+  - numeric options are range-checked (an `--idle-timeout` beyond Node's timer limit, or a 0 ms cleanup budget, were accepted).
+- **Also:**
+  - HTTP replies carry `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`;
+  - HTTP has header and request timeouts and a connection cap;
+  - a `security:` summary line and risk warnings at startup, including when running as root/QSECOFR;
+  - the README recommends a Node.js release that still gets security updates.
+
 ## 0.1.0
 
 - First draft: an HTTP/JSON API, a singleton store, and lazy plus active TTL expiry.

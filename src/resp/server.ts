@@ -13,18 +13,31 @@
 //   * each client's unparsed input is capped (client-query-buffer-limit);
 //   * a "POST" or "Host:" line (an HTTP request sent to this port, e.g. by a
 //     web page) drops the connection before anything else runs.
+// And beyond Redis:
+//   * protected mode: without a password, only loopback clients are accepted;
+//   * failed logins are counted per address, which is blocked after too many
+//     (see auth.ts), and connections that never authenticate are closed;
+//   * unauthenticated clients can't make the server hold more than 256 KB of
+//     their input, even when they never read the replies.
 
 import net from 'node:net';
+import { AuthGuard, isLoopback, PasswordCheck } from '../auth.js';
 import { checkMemory, NO_AUTH_COMMANDS, resolveCommand, type CommandSpec, type ConnectionHandle, type InfoSections } from '../commands.js';
 import { describeCommand, describeReply } from '../debuglog.js';
 import { OOM_MESSAGE } from '../memory.js';
 import { NULL_ARRAY, OK, ReplyError, SimpleString, type Reply } from '../reply.js';
 import type { Store } from '../store.js';
-import { safeEqual } from '../util.js';
 import { encode, encodeError } from './encoder.js';
 import { DEFAULT_LIMITS, ProtocolError, RespParser, UNAUTHENTICATED_LIMITS, type ParserLimits } from './parser.js';
 
 const OOM_ERROR = `OOM ${OOM_MESSAGE}`;
+// Input an unauthenticated client can make us hold (its own pipeline backed up
+// behind -NOAUTH replies it isn't reading). Redis did the same after CVE-2025-21605.
+const UNAUTH_QUERY_BUFFER = 256 * 1024;
+const DENIED =
+  '-DENIED MIMIC is running in protected mode: no password is set, so only connections from this machine (loopback) are accepted. ' +
+  'To accept other machines, set a password (--password-file or MIMIC_PASSWORD), or, only on a trusted network, start with --protected-mode no.\r\n';
+const BLOCKED = '-ERR too many failed authentication attempts from this address; try again later\r\n';
 
 export interface Logger {
   info(msg: string): void;
@@ -35,8 +48,16 @@ export interface Logger {
 }
 
 export interface RespServerOptions {
-  /** Password for AUTH (user "default"). Unset = no authentication. */
+  /** Password for AUTH (user "default"): plain, or "sha256:<hex>". Unset = no authentication. */
   password?: string;
+  /** Without a password, refuse clients that aren't on a loopback address (default true). */
+  protectedMode?: boolean;
+  /** Close connections that haven't authenticated after this many seconds (default 10; 0 = never). */
+  authTimeoutSec?: number;
+  /** Failed-login tracking, shared with the HTTP server (default: block after 10 failures a minute). */
+  authGuard?: AuthGuard;
+  /** Commands that behave as if they didn't exist (upper case). */
+  disabledCommands?: ReadonlySet<string>;
   /** Refuse connections beyond this many clients. */
   maxClients?: number;
   /** Close connections idle for this many seconds (0 = never, the Redis default). */
@@ -53,6 +74,8 @@ export interface RespServerOptions {
 
 export interface RespServer extends net.Server {
   readonly stats: { connectedClients: number; totalConnections: number; totalCommands: number; rejectedConnections: number };
+  /** Serve a connection accepted elsewhere (the TLS listener), with the same state and limits. */
+  handleConnection(socket: net.Socket): void;
   /** Disconnect all clients (used on shutdown). */
   disconnectAll(): void;
   /** Stop listening to store changes (done automatically on 'close'; call it if listen() failed). */
@@ -129,7 +152,7 @@ class Connection implements ConnectionHandle {
   constructor(
     id: number,
     readonly socket: net.Socket,
-    readonly server: { password?: string; clients: Map<number, Connection> },
+    readonly server: { password?: PasswordCheck; guard: AuthGuard; clients: Map<number, Connection> },
   ) {
     this.id = id;
     this.authenticated = !server.password;
@@ -142,10 +165,14 @@ class Connection implements ConnectionHandle {
       if (username === null) return 'nopass';
       return userOk ? 'ok' : 'wrongpass';
     }
-    if (userOk && safeEqual(password, expected)) {
+    // Always compare, even for an unknown user, so the reply time says nothing.
+    const match = expected.matches(password);
+    if (userOk && match) {
       this.authenticated = true;
       return 'ok';
     }
+    // Too many failures from this address: answer this one, then hang up.
+    if (this.server.guard.recordFailure(this.socket.remoteAddress, 'RESP AUTH')) this.requestClose();
     return 'wrongpass';
   }
 
@@ -194,8 +221,14 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
   const logger = opts.logger;
   const maxClients = opts.maxClients ?? 10_000;
   const clients = new Map<number, Connection>();
-  const shared: { password?: string; clients: Map<number, Connection> } = { clients };
-  if (opts.password) shared.password = opts.password;
+  const guard = opts.authGuard ?? new AuthGuard({ maxFailures: 10, warn: (m) => logger?.warn(m) });
+  const shared: { password?: PasswordCheck; guard: AuthGuard; clients: Map<number, Connection> } = { clients, guard };
+  // Only a hash of the password is kept (see auth.ts).
+  if (opts.password) shared.password = new PasswordCheck(opts.password);
+  const protectedMode = (opts.protectedMode ?? true) && !shared.password;
+  const authTimeoutMs = shared.password ? (opts.authTimeoutSec ?? 10) * 1000 : 0;
+  const disabled = opts.disabledCommands;
+  let lastDeniedWarning = 0;
   let nextId = 0;
 
   const stats = { connectedClients: 0, totalConnections: 0, totalCommands: 0, rejectedConnections: 0 };
@@ -268,7 +301,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
   /** Run a resolved command; errors become error replies. */
   function dispatch(conn: Connection, argv: string[], spec: CommandSpec, guardMemory = true): Reply {
     try {
-      const ctx = { store, db: store.db(conn.db), conn, serverInfo };
+      const ctx = { store, db: store.db(conn.db), conn, serverInfo, ...(disabled ? { disabled } : {}) };
       if (guardMemory) checkMemory(ctx, spec, argv);
       return spec.run(ctx, argv.slice(1));
     } catch (err) {
@@ -311,7 +344,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     // come before the authentication check.
     let spec: CommandSpec;
     try {
-      spec = resolveCommand(argv);
+      spec = resolveCommand(argv, disabled);
     } catch (err) {
       if (conn.multi && name === 'EXEC') {
         // A broken EXEC ends the transaction (Redis: execCommandAbort).
@@ -391,6 +424,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
   const normalLimits: ParserLimits = { ...DEFAULT_LIMITS, ...opts.limits };
   const limitsFor = (conn: Connection): ParserLimits => (conn.authenticated ? normalLimits : UNAUTHENTICATED_LIMITS);
   const maxQueryBuffer = opts.maxQueryBufferBytes ?? 1024 * 1024 * 1024;
+  const queryBufferLimit = (conn: Connection): number => (conn.authenticated ? maxQueryBuffer : Math.min(maxQueryBuffer, UNAUTH_QUERY_BUFFER));
 
   /** Close after flushing `out` (or at once, for silent drops). */
   function finishClose(conn: Connection, out: string, silent: boolean): void {
@@ -450,7 +484,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
         out += reply;
       }
       const held = parser.buffered + conn.multiBytes;
-      if (!conn.closing && held > maxQueryBuffer) {
+      if (!conn.closing && held > queryBufferLimit(conn)) {
         logger?.warn(`[resp] closing client ${conn.id}: query buffer of ${held} bytes exceeds the limit`);
         out += encodeError(new ReplyError('Protocol error: client query buffer exceeds limit'));
         conn.closing = true;
@@ -478,7 +512,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
   /** Input arriving while replies are backed up: buffer it, within the query buffer limit. */
   function bufferWhileBlocked(conn: Connection, parser: RespParser): void {
     const held = parser.buffered + conn.multiBytes;
-    if (held <= maxQueryBuffer) return;
+    if (held <= queryBufferLimit(conn)) return;
     logger?.warn(`[resp] closing client ${conn.id}: query buffer of ${held} bytes exceeds the limit (client is not reading replies)`);
     conn.closing = true;
     conn.waitingForDrain = false;
@@ -486,12 +520,27 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     finishClose(conn, '', true);
   }
 
-  const server = net.createServer((socket) => {
+  function handleConnection(socket: net.Socket): void {
     // Always first: an unhandled 'error' (e.g. ECONNRESET) would crash the process.
     socket.on('error', () => {
       /* the 'close' handler cleans up */
     });
 
+    const address = socket.remoteAddress;
+    if (protectedMode && !isLoopback(address)) {
+      stats.rejectedConnections++;
+      if (Date.now() - lastDeniedWarning > 60_000) {
+        lastDeniedWarning = Date.now();
+        logger?.warn(`[resp] protected mode: refused a connection from ${address} (no password is set; see --protected-mode)`);
+      }
+      endAndRelease(socket, DENIED, opts.closeGraceMs);
+      return;
+    }
+    if (guard.isBlocked(address)) {
+      stats.rejectedConnections++;
+      endAndRelease(socket, BLOCKED, opts.closeGraceMs);
+      return;
+    }
     if (clients.size >= maxClients) {
       stats.rejectedConnections++;
       endAndRelease(socket, '-ERR max number of clients reached\r\n', opts.closeGraceMs);
@@ -510,6 +559,15 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     if (opts.idleTimeoutSec && opts.idleTimeoutSec > 0) {
       socket.setTimeout(opts.idleTimeoutSec * 1000, () => socket.destroy());
     }
+    let authTimer: NodeJS.Timeout | undefined;
+    if (authTimeoutMs > 0) {
+      authTimer = setTimeout(() => {
+        if (conn.authenticated || socket.destroyed) return;
+        logger?.debug?.(`[resp] client ${conn.id} closed: not authenticated within ${authTimeoutMs / 1000} s`);
+        socket.destroy();
+      }, authTimeoutMs);
+      authTimer.unref();
+    }
 
     socket.on('data', (chunk: Buffer) => {
       if (conn.closing) return;
@@ -524,12 +582,16 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
       pump(conn, parser); // run what was received meanwhile
     });
     socket.on('close', () => {
+      clearTimeout(authTimer);
       logger?.debug?.(`[resp] client ${conn.id} disconnected`);
       unwatch(conn);
       clients.delete(conn.id);
       stats.connectedClients = clients.size;
     });
-  }) as RespServer;
+  }
+
+  const server = net.createServer(handleConnection) as RespServer;
+  server.handleConnection = handleConnection;
 
   server.on('close', unsubscribe);
   server.dispose = () => {

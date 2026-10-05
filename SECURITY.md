@@ -38,7 +38,7 @@ As this is a spare-time project, there is no bug bounty.
 **In scope**, for example:
 
 - crashing or hanging the server from a client **without** the password;
-- getting around authentication, the pre-AUTH limits, or the HTTP API's browser protections (Origin, `Sec-Fetch-Site`, Host checks, Content-Type);
+- getting around authentication, protected mode, the failed-login blocking, the login timeout, TLS client-certificate checks, `--disable-commands`, the pre-AUTH limits, or the HTTP API's browser protections (Origin, `Sec-Fetch-Site`, Host checks, Content-Type);
 - reading or changing data without the password;
 - running code on the server, reading or writing files, or reaching anything outside MIMIC's own data;
 - secrets leaking into logs or error messages (other than with `--log-level debug`, which logs values by design);
@@ -47,8 +47,8 @@ As this is a spare-time project, there is no bug bounty.
 **Out of scope**, because they are documented behaviour (see [Security model](#security-model)):
 
 - anything someone can do **with** the password, including `FLUSHALL` and reading every database;
-- reading traffic on the network: there is no TLS yet;
-- problems when MIMIC is exposed to a network without a password, despite the warning;
+- reading traffic on the network when TLS isn't used;
+- problems when MIMIC is exposed to a network without a password and with protected mode turned off;
 - an authenticated client slowing the server down with expensive commands such as `KEYS *`, as Redis can be;
 - data being lost on restart: MIMIC is an in-memory cache;
 - vulnerabilities in Node.js itself (please report those to the Node.js project), unless MIMIC uses Node in an unsafe way.
@@ -64,48 +64,61 @@ MIMIC is built to run **next to its clients**, by default on `127.0.0.1`, and to
 - **Commands that are dangerous in Redis don't exist in MIMIC.** There is no `CONFIG SET`, `SAVE`/`BGSAVE`, `MODULE`, `REPLICAOF`, `DEBUG` or Lua scripting. These are the usual ways from Redis access to running code or writing files on the server.
 - **Zero runtime dependencies.** Only Node.js itself runs in production; the dev dependencies are for building and testing.
 
-What MIMIC already protects against:
+What MIMIC protects against:
 
+- **Clients on other machines when there is no password:** protected mode (on by default) accepts only loopback clients until a password is set, as Redis does. The HTTP API listens on `127.0.0.1` unless `--http-host` says otherwise, whatever `--host` is.
+- **Eavesdropping on the network:** RESP over TLS (`--tls-port`) and HTTPS (`--http-tls`), TLS 1.2 or newer, with PEM or PKCS#12 certificates. Client certificates can be required (`--tls-ca-cert-file`).
+- **Password guessing:** failed logins are counted per address across RESP and HTTP; after `--auth-max-failures` (default 10) within a minute, the address is blocked for a minute. Failures and blocks are logged (once per address per minute, so the log can't be flooded). Loopback clients are never blocked.
+- **Password disclosure:**
+  - only a SHA-256 hash of the password is kept in memory, and the configuration itself can hold just the hash (`sha256:<hex>`, made with `mimic --hash-password`);
+  - comparisons run in constant time, and AUTH arguments are masked in debug logs;
+  - MIMIC warns about short passwords, password files others can read, and `--password` on the command line;
+  - an empty password stops startup.
+- **Unauthenticated clients tying up resources:** they must log in within `--auth-timeout` seconds (default 10), get Redis' pre-AUTH limits (10 arguments, 16 KB each), and can't make MIMIC hold more than 256 KB of their input.
 - **Web pages in a local browser** reaching the HTTP API or the RESP port:
   - HTTP requires `Content-Type: application/json`, refuses foreign `Origin`s and cross-site `Sec-Fetch-Site` requests, and checks `Host` against DNS rebinding when no password is set;
+  - the Bearer token is only accepted with the `Bearer` scheme;
+  - replies carry `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`;
   - an HTTP request sent to the RESP port drops the connection.
-- **Unauthenticated clients** buffering large amounts of data: Redis' pre-AUTH limits apply (10 arguments, 16 KB each).
-- **Resource exhaustion by a single client:** caps on value size (`--max-bulk-bytes`) and buffered input (`--max-query-buffer`); replies are streamed with backpressure.
-- **Pathological input:** glob patterns that would take exponential time, huge integer arguments, malformed protocol frames.
+- **Resource exhaustion by a single client:**
+  - caps on value size (`--max-bulk-bytes`), buffered input (`--max-query-buffer`), HTTP body size and JSON nesting depth;
+  - replies are streamed with backpressure;
+  - HTTP has timeouts (10 s for headers, 30 s per request) and at most 1,000 connections at once.
+- **Pathological input:** glob patterns that would take exponential time, huge integer arguments, malformed protocol frames, deeply nested JSON, and names like `__proto__` or `constructor`.
 - **The process dying from a full heap:** writes get `-OOM` near the V8 heap limit (`--max-memory-percent`).
-- **Password handling:**
-  - passwords are compared in constant time;
-  - an empty password stops startup;
-  - passwords are masked in debug logs.
+- **Log forging:** client-supplied text (command names, error messages quoting them) has control characters escaped in the logs; `CLIENT SETNAME`/`SETINFO` only accept printable characters, so `CLIENT LIST` can't be forged either.
+- **Misconfiguration:** numeric options are range-checked, TLS settings must be complete, unknown or essential commands can't be disabled, and a one-line `security:` summary is logged at startup, with warnings for risky setups (no password on a network address, plain text on a network address, running as root/QSECOFR).
+- **Destructive or expensive commands for applications that don't need them:** `--disable-commands FLUSHALL,FLUSHDB,KEYS`, for example. Disabled commands behave as unknown everywhere (RESP, HTTP, `MULTI`, `COMMAND`).
 
 ## Known limitations
 
-These are known and planned. Until they're addressed, take them into account when deploying.
+Take these into account when deploying.
 
-| Limitation | Impact | Until it's fixed |
+| Limitation | Impact | What to do |
 |---|---|---|
-| **No TLS** on RESP or HTTP | The password and all data cross the network in clear text. | Keep MIMIC on the same machine as its clients, or tunnel it (SSH port forwarding, stunnel). |
-| **No "protected mode"** | Binding to a network address without a password only logs a warning; Redis refuses outside clients in that case. | Never set `MIMIC_HOST` to anything but loopback without a password. |
-| **The HTTP API binds to the same address as RESP** by default | Exposing RESP with `MIMIC_HOST=0.0.0.0` exposes HTTP too. | Set `MIMIC_HTTP_HOST=127.0.0.1`, or `--http-port off` if you don't use HTTP. |
-| **No limit on password attempts**, and failed attempts aren't logged | Someone who can reach the port can guess passwords as fast as the network allows (as with Redis). | Use a long random password (32+ characters), and restrict who can reach the port. |
-| **Unauthenticated connections have no time limit** (up to `--max-clients`, default 10,000) | Many idle unauthenticated connections can use memory and connection slots. | Restrict who can reach the port; lower `--max-clients`; set `--idle-timeout`. |
-| **One all-powerful password**, no read-only or per-command restriction | Any client with the password can `FLUSHALL`. | Separate instances per application. |
+| **One password, full access** (no users or ACLs) | Any client with the password can use every enabled command in every database. | Disable what applications don't need (`--disable-commands`), and run separate instances for applications that must not see each other's data. |
+| **Expensive commands from authenticated clients** (`KEYS *`, `LRANGE 0 -1` on huge lists, `HGETALL` on huge hashes) | They block the server while they run, as in Redis. | `--disable-commands KEYS`, use SCAN; keep values and collections a sensible size; lower `--max-bulk-bytes`. |
+| **Certificates are read at startup** | Renewing a certificate needs a restart. | Restart MIMIC after renewing (a cache restart empties it). |
+| **No per-address connection limit** | One address can open up to `--max-clients` connections (unauthenticated ones are closed after `--auth-timeout`). | Restrict who can reach the port; lower `--max-clients` if needed. |
 
 ## Deployment checklist
 
 **Everywhere:**
 
 - [ ] Keep the default bind address (`127.0.0.1`) unless other machines must connect.
-- [ ] If other machines must connect: set a long random password, put TLS in front (tunnel), restrict access by firewall, set `MIMIC_HTTP_HOST=127.0.0.1` or `--http-port off`.
-- [ ] Use `--password-file` (or `MIMIC_PASSWORD_FILE`) rather than `--password`, which other users can see in the process list.
+- [ ] If other machines must connect: set a long random password, use TLS (`--tls-port`, and `--port off` so there is no plain-text port), restrict access by firewall, and keep the HTTP API on `127.0.0.1` (or give it `--http-tls`). See the README's "Accepting connections from other machines".
+- [ ] Use `--password-file` (or `MIMIC_PASSWORD_FILE`) rather than `--password`, which other users can see in the process list. Consider storing only the hash (`mimic --hash-password`).
+- [ ] Disable commands your applications don't use, for example `--disable-commands FLUSHALL,FLUSHDB,KEYS`.
+- [ ] Check the `security:` line and any warnings in the startup log.
 - [ ] Use a supported Node.js LTS release, and keep it updated.
 - [ ] Don't run `--log-level debug` in production: it logs values, which may be sensitive.
 - [ ] Size the heap (`--max-old-space-size`) so the `-OOM` guard, not the operating system, decides when the cache is full.
 
 **On IBM i:**
 
-- [ ] Run MIMIC under a **dedicated user profile** of class `*USER` with no special authorities, never under QSECOFR or a profile with `*ALLOBJ`.
+- [ ] Run MIMIC under a **dedicated user profile** of class `*USER` with no special authorities, never under QSECOFR or a profile with `*ALLOBJ`. MIMIC warns if it runs as uid 0.
 - [ ] Make the installation directory writable **only by its owner**. Anyone who can change the files in `dist/` can run code as MIMIC's profile.
-- [ ] Protect the password file: `chmod 600`, owned by MIMIC's profile, `*PUBLIC *EXCLUDE`.
+- [ ] Protect the password file, the TLS key or PKCS#12 file and its passphrase file: `chmod 600`, owned by MIMIC's profile, `*PUBLIC *EXCLUDE`.
+- [ ] For TLS, export the certificate with its private key from Digital Certificate Manager as PKCS#12, and use `--tls-pfx-file` with `--tls-key-pass-file`.
 - [ ] If the port must be reachable from other systems, bind to one specific interface address instead of `0.0.0.0`, and allow only the hosts that need it (for example with IP packet filtering).
 - [ ] Remember that Service Commander keeps MIMIC's log output in its log files; protect them accordingly.

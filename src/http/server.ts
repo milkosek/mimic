@@ -25,20 +25,36 @@
 //   * requests carrying an Origin header are refused unless allow-listed;
 //   * without a password, the Host header must be an IP address, "localhost"
 //     or an allow-listed name, which defeats DNS rebinding.
+//
+// Network protection, shared with the RESP server: protected mode (no
+// password -> loopback clients only), per-address blocking after repeated
+// wrong tokens, optional HTTPS, and tight timeouts and connection limits.
 
 import http from 'node:http';
+import https from 'node:https';
 import { isIPv6 } from 'node:net';
+import type tls from 'node:tls';
+import { AuthGuard, isLoopback, PasswordCheck } from '../auth.js';
 import { fromText, toText } from '../bytes.js';
 import { execute, type InfoSections } from '../commands.js';
 import { describeCommand, describeReply } from '../debuglog.js';
 import { MapReply, NullArray, ReplyError, SimpleString, VerbatimString, type Reply } from '../reply.js';
 import type { Logger } from '../resp/server.js';
 import type { Database, Store } from '../store.js';
-import { safeEqual } from '../util.js';
 
 export interface HttpServerOptions {
-  /** Require "Authorization: Bearer <token>" on every route except /health. */
+  /** Require "Authorization: Bearer <token>" on every route except /health. Plain, or "sha256:<hex>". */
   authToken?: string;
+  /** Without a token, refuse clients that aren't on a loopback address (default true). */
+  protectedMode?: boolean;
+  /** Failed-login tracking, shared with the RESP server. */
+  authGuard?: AuthGuard;
+  /** Commands that behave as if they didn't exist (upper case). */
+  disabledCommands?: ReadonlySet<string>;
+  /** Serve HTTPS with these TLS settings. */
+  tls?: tls.TlsOptions;
+  /** Concurrent connections accepted (default 1000). */
+  maxConnections?: number;
   bodyLimitBytes?: number;
   /** Origins (e.g. "https://intranet.example") allowed to call the API from a browser. */
   allowedOrigins?: string[];
@@ -77,6 +93,8 @@ function send(res: http.ServerResponse, status: number, body: unknown, extraHead
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(payload),
+    'x-content-type-options': 'nosniff', // never let a browser treat a reply as HTML or script
+    'cache-control': 'no-store', // cached data must not end up in proxies or browser caches
     ...extraHeaders,
   });
   res.end(payload);
@@ -109,7 +127,12 @@ function readJson(req: http.IncomingMessage, limit: number): Promise<unknown> {
         reject(new HttpError(400, 'invalid JSON body'));
         return;
       }
-      const unsafe = findUnsafeInteger(parsed);
+      const problem = checkJson(parsed);
+      if (problem === 'deep') {
+        reject(new HttpError(400, `JSON is nested too deeply (more than ${MAX_JSON_DEPTH} levels)`));
+        return;
+      }
+      const unsafe = problem;
       if (unsafe !== undefined) {
         reject(
           new HttpError(
@@ -125,24 +148,31 @@ function readJson(req: http.IncomingMessage, limit: number): Promise<unknown> {
   });
 }
 
+const MAX_JSON_DEPTH = 64;
+
 /**
- * JSON.parse silently rounds integers beyond 2^53 (1234567890123456789 ->
- * 1234567890123456800), so such a number can't be stored as sent. Find one
- * anywhere in the body, so the request can be refused instead of corrupting
- * the value. (The original digits are gone by now; the message shows the
- * rounded value.)
+ * Two checks on a parsed body:
+ *   * nesting deeper than MAX_JSON_DEPTH is refused ('deep'): turning such a
+ *     value back into text (non-string arguments are stored as JSON) would
+ *     overflow the stack;
+ *   * JSON.parse silently rounds integers beyond 2^53 (1234567890123456789 ->
+ *     1234567890123456800), so such a number can't be stored as sent: return
+ *     it, so the request can be refused instead of corrupting the value. (The
+ *     original digits are gone by now; the message shows the rounded value.)
  */
-function findUnsafeInteger(root: unknown): number | undefined {
-  const stack: unknown[] = [root]; // iterative: any nesting depth
+function checkJson(root: unknown): number | 'deep' | undefined {
+  const stack: [unknown, number][] = [[root, 0]]; // iterative: no recursion on hostile input
+  let unsafe: number | undefined;
   while (stack.length > 0) {
-    const v = stack.pop();
+    const [v, depth] = stack.pop()!;
     if (typeof v === 'number') {
-      if (Number.isInteger(v) && !Number.isSafeInteger(v)) return v;
+      if (unsafe === undefined && Number.isInteger(v) && !Number.isSafeInteger(v)) unsafe = v;
     } else if (v !== null && typeof v === 'object') {
-      for (const item of Array.isArray(v) ? v : Object.values(v)) stack.push(item);
+      if (depth >= MAX_JSON_DEPTH) return 'deep';
+      for (const item of Array.isArray(v) ? v : Object.values(v)) stack.push([item, depth + 1]);
     }
   }
-  return undefined;
+  return unsafe;
 }
 
 /** JSON value -> command argument (binary string). */
@@ -194,8 +224,14 @@ function hostName(header: string): string {
 const isJson = (contentType: string | undefined): boolean =>
   !!contentType && /^application\/json\s*(;|$)/i.test(contentType.trim());
 
-export function createHttpServer(store: Store, opts: HttpServerOptions = {}): http.Server {
+export function createHttpServer(store: Store, opts: HttpServerOptions = {}): http.Server | https.Server {
   const limit = opts.bodyLimitBytes ?? 1024 * 1024;
+  const token = opts.authToken ? new PasswordCheck(opts.authToken) : undefined; // only a hash is kept
+  const protectedMode = (opts.protectedMode ?? true) && !token;
+  const guard = opts.authGuard ?? new AuthGuard({ maxFailures: 10, warn: (m) => opts.logger?.warn(m) });
+  const disabled = opts.disabledCommands;
+  const isDisabled = (name: string): boolean => disabled?.has(name) ?? false;
+  let lastDeniedWarning = 0;
   const allowedOrigins = new Set((opts.allowedOrigins ?? []).map((o) => o.trim().toLowerCase().replace(/\/$/, '')));
   const allowedHosts = new Set((opts.allowedHosts ?? []).map(hostName)); // so "cache.example.:6380" works too
 
@@ -212,7 +248,7 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
     if (site !== undefined && site !== 'same-origin' && site !== 'none' && !originAllowed) {
       throw new HttpError(403, `cross-site browser requests are not allowed (Sec-Fetch-Site: ${site})`);
     }
-    if (!opts.authToken) {
+    if (!token) {
       const name = hostName(req.headers.host ?? '');
       const ok = name === '' || name === 'localhost' || name.endsWith('.localhost') || IPV4.test(name) || isIPv6(name) || allowedHosts.has(name);
       if (!ok) {
@@ -234,7 +270,7 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
   // Command errors are client errors (like a Redis error reply), not 500s.
   function run(db: Database, argv: string[]): { result: Json } | { error: string } {
     try {
-      const reply = execute({ store, db, serverInfo }, argv);
+      const reply = execute({ store, db, serverInfo, ...(disabled ? { disabled } : {}) }, argv);
       opts.logger?.debug?.(`[http] db${db.index}: ${describeCommand(argv)} -> ${describeReply(reply)}`);
       return { result: toJson(reply) };
     } catch (err) {
@@ -247,10 +283,15 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
   }
 
   function authorised(req: http.IncomingMessage): boolean {
-    if (!opts.authToken) return true;
-    const header = req.headers.authorization ?? '';
-    const token = header.replace(/^Bearer\s+/i, '');
-    return safeEqual(fromText(token), fromText(opts.authToken));
+    if (!token) return true;
+    const header = req.headers.authorization;
+    if (header === undefined) return false; // no attempt made: not counted as a failure
+    // Only the Bearer scheme. Node hands header values over as latin1, i.e.
+    // one char per byte - the same form as AUTH arguments on the RESP port.
+    const m = /^Bearer[ \t]+(.+)$/is.exec(header.trim());
+    if (m && token.matches(m[1]!)) return true;
+    guard.recordFailure(req.socket.remoteAddress, 'HTTP token');
+    return false;
   }
 
   async function route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -258,6 +299,17 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
     const { pathname } = url;
     const method = req.method ?? 'GET';
 
+    const address = req.socket.remoteAddress;
+    if (protectedMode && !isLoopback(address)) {
+      if (Date.now() - lastDeniedWarning > 60_000) {
+        lastDeniedWarning = Date.now();
+        opts.logger?.warn(`[http] protected mode: refused a request from ${address} (no password is set; see --protected-mode)`);
+      }
+      throw new HttpError(403, 'protected mode: no password is set, so only requests from this machine are accepted');
+    }
+    if (guard.isBlocked(address)) {
+      return send(res, 429, { error: 'too many failed authentication attempts from this address; try again later' }, { 'retry-after': String(guard.retryAfterSec(address)) });
+    }
     if (method === 'GET' && pathname === '/health') return send(res, 200, { status: 'ok' });
     checkBrowserSafety(req);
     if (!authorised(req)) throw new HttpError(401, 'unauthorised');
@@ -270,6 +322,7 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
     const db = store.db(Number(dbParam));
 
     if (method === 'GET' && pathname === '/info') {
+      if (isDisabled('INFO')) throw new HttpError(403, 'INFO is disabled on this server');
       return send(res, 200, { ...store.info(), server: serverInfo() });
     }
 
@@ -285,7 +338,9 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
         try {
           return run(db, parseCommand(cmd));
         } catch (err) {
-          return { error: err instanceof Error ? err.message : String(err) };
+          if (err instanceof HttpError) return { error: err.message };
+          opts.logger?.error('[http] pipeline command failed', err);
+          return { error: 'internal error' }; // never internal details
         }
       });
       return send(res, 200, { results });
@@ -294,7 +349,10 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
     if (method === 'GET' && pathname === '/keys') {
       const pattern = url.searchParams.get('pattern') ?? '*';
       const cursor = url.searchParams.get('cursor');
-      if (cursor === null) return send(res, 200, { keys: toJson(db.keys(fromText(pattern))) });
+      if (cursor === null) {
+        const out = run(db, ['KEYS', fromText(pattern)]); // through the command table, so --disable-commands applies
+        return 'error' in out ? send(res, 400, out) : send(res, 200, { keys: out.result });
+      }
       const argv = ['SCAN', cursor, 'MATCH', fromText(pattern), 'COUNT', url.searchParams.get('count') ?? '100'];
       const out = run(db, argv);
       if ('error' in out) return send(res, 400, out);
@@ -309,6 +367,7 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
     if (match) {
       const key = fromText(decodeURIComponent(match[1]!));
       if (method === 'GET') {
+        if (isDisabled('GET')) throw new HttpError(403, 'GET is disabled on this server');
         const entry = db.inspect(key);
         if (!entry) return send(res, 404, { error: 'not found', key: toText(key) });
         let value: Json;
@@ -337,13 +396,16 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
         if (out.result === null) return send(res, 409, { error: 'condition not met (NX/XX)', key: toText(key) });
         return send(res, 200, { ok: true, key: toText(key), ttlMs: db.pttl(key) });
       }
-      if (method === 'DELETE') return send(res, 200, { deleted: db.del([key]) });
+      if (method === 'DELETE') {
+        const out = run(db, ['DEL', key]);
+        return 'error' in out ? send(res, 400, out) : send(res, 200, { deleted: out.result });
+      }
     }
 
     throw new HttpError(404, `no route for ${method} ${pathname}`);
   }
 
-  return http.createServer((req, res) => {
+  const handler = (req: http.IncomingMessage, res: http.ServerResponse): void => {
     if (opts.logger?.debug) {
       const debug = opts.logger.debug;
       const t0 = performance.now();
@@ -359,5 +421,11 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
       opts.logger?.error('[http] unhandled error', err);
       send(res, 500, { error: 'internal error' });
     });
-  });
+  };
+  const server = opts.tls ? https.createServer(opts.tls, handler) : http.createServer(handler);
+  // Slow or idle clients can't hold connections for long, and there is a cap on how many.
+  server.headersTimeout = 10_000;
+  server.requestTimeout = 30_000;
+  server.maxConnections = opts.maxConnections ?? 1000;
+  return server;
 }

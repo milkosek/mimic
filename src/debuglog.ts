@@ -17,9 +17,14 @@ function show(arg: string): string {
   return text.length > MAX_ARG ? `${quoted.slice(0, -1)}…"(${arg.length} bytes)` : quoted;
 }
 
+/** Escape control characters, so client-supplied text can't start a fake log line. */
+function clean(text: string): string {
+  return text.replace(/[\x00-\x1f\x7f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+}
+
 /** `SET "hello" "world"`; passwords are masked. */
 export function describeCommand(argv: readonly string[]): string {
-  const name = argv[0]!.toUpperCase();
+  const name = clean(argv[0]!.toUpperCase());
   const args = argv.slice(1).map(show);
   if (name === 'AUTH') args.fill('"(redacted)"');
   if (name === 'HELLO') {
@@ -35,8 +40,8 @@ export function describeReply(reply: Reply, depth = 0): string {
   if (reply === null || reply instanceof NullArray) return '(nil)';
   if (typeof reply === 'number' || typeof reply === 'bigint') return `(integer) ${reply}`;
   if (typeof reply === 'string') return show(reply);
-  if (reply instanceof SimpleString) return reply.value;
-  if (reply instanceof ReplyError) return `(error) ${reply.message}`;
+  if (reply instanceof SimpleString) return clean(reply.value);
+  if (reply instanceof ReplyError) return `(error) ${clean(reply.message)}`; // may quote the command name
   if (reply instanceof VerbatimString) return `(text, ${reply.value.length} bytes)`;
   const list = (items: string[], total: number): string =>
     `[${items.join(', ')}${total > items.length ? `, … (${total} in all)` : ''}]`;
