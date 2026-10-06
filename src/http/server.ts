@@ -295,7 +295,12 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
   }
 
   async function route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? '/', 'http://localhost');
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      throw new HttpError(400, 'malformed request URL'); // e.g. "GET http://[/x": a client error, not ours
+    }
     const { pathname } = url;
     const method = req.method ?? 'GET';
 
@@ -307,10 +312,12 @@ export function createHttpServer(store: Store, opts: HttpServerOptions = {}): ht
       }
       throw new HttpError(403, 'protected mode: no password is set, so only requests from this machine are accepted');
     }
+    // Health checks keep working for a blocked address (a monitor sharing an
+    // address with a misconfigured client must not see the cache as down).
+    if (method === 'GET' && pathname === '/health') return send(res, 200, { status: 'ok' });
     if (guard.isBlocked(address)) {
       return send(res, 429, { error: 'too many failed authentication attempts from this address; try again later' }, { 'retry-after': String(guard.retryAfterSec(address)) });
     }
-    if (method === 'GET' && pathname === '/health') return send(res, 200, { status: 'ok' });
     checkBrowserSafety(req);
     if (!authorised(req)) throw new HttpError(401, 'unauthorised');
 

@@ -64,6 +64,10 @@ interface AttemptRecord {
 
 const MAX_TRACKED = 10_000; // bound the table itself
 
+/** The same client over IPv4 and IPv4-mapped IPv6 ("::ffff:10.0.0.1") counts as one address. */
+const keyOf = (address: string | undefined): string | undefined =>
+  address?.startsWith('::ffff:') ? address.slice(7) : address;
+
 export class AuthGuard {
   readonly #records = new Map<string, AttemptRecord>();
   readonly #max: number;
@@ -80,20 +84,22 @@ export class AuthGuard {
 
   /** Whether connections / requests from this address are currently refused. */
   isBlocked(address: string | undefined): boolean {
-    if (!address) return false;
-    const r = this.#records.get(address);
+    const key = keyOf(address);
+    if (!key) return false;
+    const r = this.#records.get(key);
     return r !== undefined && r.blockedUntil > Date.now();
   }
 
   /** Seconds until the block on `address` ends (for Retry-After). */
   retryAfterSec(address: string | undefined): number {
-    const r = address ? this.#records.get(address) : undefined;
+    const key = keyOf(address);
+    const r = key ? this.#records.get(key) : undefined;
     return r ? Math.max(1, Math.ceil((r.blockedUntil - Date.now()) / 1000)) : 1;
   }
 
   /** Record a failed attempt. Returns true if the address is now blocked. */
   recordFailure(address: string | undefined, via: string): boolean {
-    const ip = address ?? 'unknown';
+    const ip = keyOf(address) ?? 'unknown';
     const now = Date.now();
     let r = this.#records.get(ip);
     if (!r || now - r.windowStart > this.#windowMs) {
@@ -122,11 +128,13 @@ export class AuthGuard {
       if (r.blockedUntil <= now && now - r.windowStart > this.#windowMs) this.#records.delete(ip);
     }
     // Still nearly full (an attack from very many addresses): drop the oldest
-    // tenth in one go, so this scan doesn't run again on every new address.
-    // Blocked addresses are kept, so a flood can't be used to lift a block.
-    for (const [ip, r] of this.#records) {
+    // tenth in one go, so this scan doesn't run again for the next thousand
+    // new addresses. This is a hard cap: an attacker who controls thousands of
+    // addresses could lift the oldest blocks, but each of those addresses
+    // still only gets a few guesses a minute.
+    for (const ip of this.#records.keys()) {
       if (this.#records.size < MAX_TRACKED * 0.9) break;
-      if (r.blockedUntil <= now) this.#records.delete(ip);
+      this.#records.delete(ip);
     }
   }
 }

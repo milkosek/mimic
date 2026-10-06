@@ -28,8 +28,16 @@ export function describeCommand(argv: readonly string[]): string {
   const args = argv.slice(1).map(show);
   if (name === 'AUTH') args.fill('"(redacted)"');
   if (name === 'HELLO') {
-    const i = argv.findIndex((a, n) => n > 1 && a.toUpperCase() === 'AUTH');
-    if (i > 0 && args[i + 1] !== undefined) args[i + 1] = '"(redacted)"';
+    // Walk the options as HELLO parses them: HELLO protover [AUTH user pass] [SETNAME name].
+    for (let i = 2; i < argv.length; i++) {
+      const opt = argv[i]!.toUpperCase();
+      if (opt === 'AUTH' && i + 2 < argv.length) {
+        args[i + 1] = '"(redacted)"'; // args is argv without the command name
+        i += 2;
+      } else if (opt === 'SETNAME') {
+        i += 1;
+      }
+    }
   }
   const shown = args.length > MAX_ARGS ? [...args.slice(0, MAX_ARGS), `… (+${args.length - MAX_ARGS} more)`] : args;
   return [name, ...shown].join(' ');

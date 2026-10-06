@@ -17,7 +17,7 @@ I started this project partly out of noticing the gap for modernizing IBMi as a 
 - **An HTTP/JSON API as well**, for callers that have no Redis client, such as RPG or SQL on IBM i (through the `QSYS2.HTTP_*` functions), shell scripts or health checks.
 - **Memory only, on purpose.** Redis writes snapshots to disk by default. MIMIC never persists anything: a restart gives you an empty cache. It really is *merely* an in-memory cache.
 
-> Status: pre-release (0.2.1). It isn't on npm yet; it will be published as `mimicache` (the name `mimic` is taken). See [Install](#install).
+> Status: 0.3.0, the first public release. It isn't on npm yet; it will be published as `mimicache` (the name `mimic` is taken). See [Install](#install).
 
 ---
 
@@ -323,6 +323,8 @@ const daemon = await startDaemon({ ...config, port: 6379, httpPort: null });
 ```
 
 `createRespServer()` and `createHttpServer()` default to the same protections as the daemon: protected mode on, a 10 s login timeout, and blocking after 10 failed logins a minute.
+
+The store is one per process. Several daemons in the same process share it: the settings of the first one apply (MIMIC warns if later ones differ), and expiry keeps running until the last daemon closes.
 
 ## Development
 

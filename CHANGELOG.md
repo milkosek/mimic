@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.3.0 (first public release)
+
+Everything since the 0.1.0 draft. The 0.2.x versions were internal milestones and were never published.
 
 - Rewritten in TypeScript (strict). It compiles to plain ES2022 JavaScript and runs on Node.js 18 or newer with zero runtime dependencies.
 - **Redis protocol (RESP) over TCP.** redis-cli, ioredis, node-redis, redis-py and other standard clients work without changes.
@@ -128,6 +130,19 @@ Security hardening before the first release (after an independent review of the 
   - `/pipeline` could return internal error messages;
   - deeply nested JSON gave a 500 (now a 400);
   - numeric options are range-checked (an `--idle-timeout` beyond Node's timer limit, or a 0 ms cleanup budget, were accepted).
+- **Fixed in a final pre-release review:**
+  - a blocked address could keep guessing on connections it had opened before the block; now every AUTH from a blocked address is refused without checking the password, and the connection is closed;
+  - connections that never finished the TLS handshake didn't count towards `--max-clients`, lived for 2 minutes and kept shutdown waiting; the handshake now has 10 s, and shutdown closes them;
+  - with `--tls-auth-clients optional`, a client certificate the CA didn't sign was accepted; it's now refused (no certificate at all is still fine);
+  - `RESET` after the login timer had run left the client logged out with no timer; `RESET` now restarts it;
+  - failed logins over IPv4 and IPv4-mapped IPv6 (`::ffff:…`) counted as different addresses;
+  - the failed-login table could get slow when full of blocked addresses; it now has a hard cap;
+  - `/health` answered 429 for a blocked address; health checks now always work;
+  - a malformed request URL gave a 500 and an error log entry; it's now a 400;
+  - the HTTP API's `INFO` and `CONFIG GET` showed different values from RESP (e.g. `timeout`, `proto-max-bulk-len`);
+  - closing one of two daemons in the same process stopped the expiry timer for the other; the timer now runs until the last one closes, and differing store settings are reported;
+  - debug logs could show a password from `HELLO … SETNAME AUTH AUTH user pass`;
+  - small things: `--port 0 --tls-port 0` was rejected, `--log-level DEBUG` wasn't accepted, and `--hash-password`, `--help` and `--version` failed when the environment held incomplete server settings.
 - **Also:**
   - HTTP replies carry `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`;
   - HTTP has header and request timeouts and a connection cap;

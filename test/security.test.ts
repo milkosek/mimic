@@ -428,3 +428,135 @@ describe('sweep findings', () => {
     }
   });
 });
+
+describe('final review findings', () => {
+  test('a blocked address gets no more guesses on connections it opened before the block', { skip: needsExternal }, async () => {
+    const d = await startTestDaemon({ host: '0.0.0.0', httpHost: '0.0.0.0', password: 'a-long-test-password', authMaxFailures: 3 });
+    try {
+      const ip = externalIp!;
+      // Open a spare connection first, then get the address blocked on another one.
+      const spare = net.connect(d.respPort!, ip);
+      spare.on('error', () => {});
+      await new Promise((r) => spare.once('connect', r));
+      await exchangeFrom(ip, d.respPort!, Buffer.concat([cmd('AUTH', 'w1'), cmd('AUTH', 'w2'), cmd('AUTH', 'w3')]));
+      const reply = await new Promise<string>((resolve) => {
+        let data = '';
+        spare.on('data', (c) => (data += c.toString('latin1')));
+        spare.on('close', () => resolve(data));
+        spare.write(Buffer.concat([cmd('AUTH', 'a-long-test-password'), cmd('PING')]));
+      });
+      assert.match(reply, /^-WRONGPASS/, 'even the right password is refused while blocked');
+      assert.ok(!reply.includes('PONG'));
+      // Health checks still work for the blocked address.
+      assert.equal((await httpFrom(ip, d.httpPort!, '/health')).status, 200);
+    } finally {
+      await d.close();
+    }
+  });
+
+  test('AuthGuard treats IPv4-mapped addresses as the same client, and stays fast when full of blocked addresses', () => {
+    const g = new AuthGuard({ maxFailures: 1 });
+    g.recordFailure('192.0.2.7', 'test');
+    assert.equal(g.isBlocked('::ffff:192.0.2.7'), true);
+    const t0 = performance.now();
+    for (let i = 0; i < 40_000; i++) g.recordFailure(`10.${i >> 16}.${(i >> 8) & 255}.${i & 255}`, 'test');
+    const ms = performance.now() - t0;
+    assert.ok(ms < 2000, `40,000 blocked addresses took ${ms.toFixed(0)} ms`);
+  });
+
+  test('RESET logs the client out and restarts the login timer', async () => {
+    const d = await startTestDaemon({ password: 'a-long-test-password', authTimeoutSec: 1, httpPort: null });
+    try {
+      const s = net.connect(d.respPort!, '127.0.0.1');
+      s.on('error', () => {});
+      s.resume(); // read replies, so the close is noticed
+      const closed = new Promise<number>((r) => s.on('close', () => r(Date.now())));
+      s.write(cmd('AUTH', 'a-long-test-password'));
+      await sleep(1300); // past the first timer
+      const resetAt = Date.now();
+      s.write(cmd('RESET'));
+      const at = await Promise.race([closed, sleep(4000).then(() => -1)]);
+      assert.ok(at > 0, 'closed after RESET without a new login');
+      assert.ok(at - resetAt >= 800, `closed ${at - resetAt} ms after RESET`);
+    } finally {
+      await d.close();
+    }
+  });
+
+  test('a malformed request URL is a 400, not a 500', async () => {
+    const d = await startTestDaemon();
+    try {
+      const res = await rawExchange(d.httpPort!, 'GET http://[/x HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+      assert.match(res, /^HTTP\/1\.1 400/);
+    } finally {
+      await d.close();
+    }
+  });
+
+  test('INFO and CONFIG GET give the same values over HTTP as over RESP', async () => {
+    const d = await startTestDaemon({ idleTimeoutSec: 300, maxBulkBytes: 1_000_000 });
+    try {
+      const http = await httpFrom('127.0.0.1', d.httpPort!, '/command', {}, '["CONFIG","GET","timeout","proto-max-bulk-len"]');
+      assert.deepEqual(JSON.parse(http.text).result, { timeout: '300', 'proto-max-bulk-len': '1000000' });
+    } finally {
+      await d.close();
+    }
+  });
+
+  test('with --tls-auth-clients optional, no certificate is fine but an untrusted one is refused', async () => {
+    const ca = readFileSync(fixture('ca.crt'));
+    const d = await startTestDaemon({
+      tlsPort: 0, tlsCertFile: fixture('server.crt'), tlsKeyFile: fixture('server.key'), tlsCaCertFile: fixture('ca.crt'), tlsAuthClients: 'optional', httpPort: null,
+    });
+    const ping = (opts: tls.ConnectionOptions): Promise<string> =>
+      new Promise((resolve) => {
+        const s = tls.connect({ port: d.respTlsPort!, host: '127.0.0.1', ca, servername: 'localhost', ...opts }, () => s.write(cmd('PING')));
+        let data = '';
+        s.on('data', (c) => {
+          data += c.toString('latin1');
+          if (data.endsWith('\r\n')) s.end();
+        });
+        s.on('close', () => resolve(data));
+        s.on('error', (e) => resolve(`error: ${e.message}`));
+      });
+    try {
+      assert.equal(await ping({}), '+PONG\r\n');
+      assert.equal(await ping({ cert: readFileSync(fixture('client.crt')), key: readFileSync(fixture('client.key')) }), '+PONG\r\n');
+      const rogue = await ping({ cert: readFileSync(fixture('untrusted-client.crt')), key: readFileSync(fixture('untrusted-client.key')) });
+      assert.ok(!rogue.includes('PONG'), rogue);
+    } finally {
+      await d.close();
+    }
+  });
+
+  test('shutdown does not wait for connections stuck before the TLS handshake', async () => {
+    const d = await startTestDaemon({ tlsPort: 0, tlsCertFile: fixture('server.crt'), tlsKeyFile: fixture('server.key'), httpPort: null });
+    const raw = net.connect(d.respTlsPort!, '127.0.0.1'); // never starts the handshake
+    raw.on('error', () => {});
+    await new Promise((r) => raw.once('connect', r));
+    await sleep(50);
+    const t0 = Date.now();
+    await d.close();
+    assert.ok(Date.now() - t0 < 1000, `close() took ${Date.now() - t0} ms`);
+    raw.destroy();
+  });
+
+  test('two daemons in one process share the store timer until the last one closes', async () => {
+    const { Store } = await import('../src/store.js');
+    const before = Store.getInstance().running;
+    const a = await startTestDaemon({ httpPort: null });
+    const b = await startTestDaemon({ httpPort: null });
+    await a.close();
+    assert.equal(Store.getInstance().running, true, 'b still needs expiry');
+    await b.close();
+    assert.equal(Store.getInstance().running, before);
+  });
+
+  test('configuration nits', () => {
+    assert.doesNotThrow(() => loadConfig(['--port', '0', '--tls-port', '0', '--tls-pfx-file', 'x.p12'], {}));
+    assert.equal(loadConfig(['--log-level', 'DEBUG'], {}).config.logLevel, 'debug');
+    // --hash-password / --help / --version work even if the environment's server settings are incomplete.
+    assert.equal(loadConfig(['--hash-password'], { MIMIC_PORT: 'off', MIMIC_TLS_CERT_FILE: 'x' }).hashPassword, true);
+    assert.equal(loadConfig(['--version'], { MIMIC_IDLE_TIMEOUT: 'abc' }).version, true);
+  });
+});

@@ -8,5 +8,6 @@ else, and never add `ca.crt` to a trust store.
 - `server.crt` / `server.key`: server certificate for `localhost`, `127.0.0.1` and `::1`
 - `server.p12`: the same, as PKCS#12, passphrase in `pfx-pass.txt`
 - `client.crt` / `client.key`: client certificate for mutual-TLS tests
+- `untrusted-client.crt` / `untrusted-client.key`: a self-signed client certificate the test CA didn't sign
 
 They are valid until about 2126.

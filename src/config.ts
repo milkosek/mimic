@@ -149,8 +149,8 @@ function convert(def: OptionDef, raw: string, source: string): unknown {
       return n;
     }
     case 'level':
-      if (!LEVELS.includes(raw as LogLevel)) bad(`expected one of ${LEVELS.join(', ')}`);
-      return raw;
+      if (!LEVELS.includes(raw.toLowerCase() as LogLevel)) bad(`expected one of ${LEVELS.join(', ')}`);
+      return raw.toLowerCase();
     case 'list':
       return raw
         .split(',')
@@ -218,6 +218,15 @@ export interface ParsedArgs {
 }
 
 export function loadConfig(argv: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): ParsedArgs {
+  // --help, --version and --hash-password don't start a server, so the rest of
+  // the configuration (which may be incomplete in that shell) isn't checked.
+  const help = argv.includes('-h') || argv.includes('--help');
+  const version = argv.includes('-v') || argv.includes('--version');
+  const hashPassword = argv.includes('--hash-password');
+  if (help || version || hashPassword) {
+    return { config: loadConfig([], {}).config, help, version, hashPassword, warnings: [] };
+  }
+
   const envValues: Record<string, unknown> = {};
   const flagValues: Record<string, unknown> = {};
 
@@ -229,23 +238,8 @@ export function loadConfig(argv: string[] = process.argv.slice(2), env: NodeJS.P
     envValues[def.key] = convert(def, raw, def.env);
   }
 
-  let help = false;
-  let version = false;
-  let hashPassword = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
-    if (arg === '-h' || arg === '--help') {
-      help = true;
-      continue;
-    }
-    if (arg === '--hash-password') {
-      hashPassword = true;
-      continue;
-    }
-    if (arg === '-v' || arg === '--version') {
-      version = true;
-      continue;
-    }
     const m = /^--([a-z-]+)(?:=(.*))?$/s.exec(arg);
     const def = m && OPTIONS.find((o) => o.flag === m[1]);
     if (!m || !def) throw new ConfigError(`unknown option: ${arg} (see --help)`);
@@ -306,7 +300,8 @@ export function loadConfig(argv: string[] = process.argv.slice(2), env: NodeJS.P
   if (config.port === null && config.tlsPort === null) {
     throw new ConfigError('--port is off and no --tls-port is set: there would be no way to connect');
   }
-  if (config.port !== null && config.port === config.tlsPort) throw new ConfigError('--port and --tls-port must differ');
+  // (Port 0 means "any free port" for both, so it may repeat.)
+  if (config.port !== null && config.port !== 0 && config.port === config.tlsPort) throw new ConfigError('--port and --tls-port must differ');
   if (!config.password && !config.protectedMode && !isLoopbackHost(config.host)) {
     warnings.push('protected mode is off and there is no password: anyone who can reach this port can read and change the cache');
   }

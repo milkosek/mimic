@@ -23,6 +23,9 @@ function read(file: string, what: string): Buffer {
 export function loadTlsOptions(c: MimicConfig): tls.TlsOptions {
   const opts: tls.TlsOptions = {
     minVersion: 'TLSv1.2', // TLS 1.0 / 1.1 are broken; Node's default is the same, but be explicit
+    // A client gets 10 s to finish the handshake (Node's default is 120 s), so
+    // half-open connections can't pile up before the login timer even starts.
+    handshakeTimeout: 10_000,
   };
   if (c.tlsKeyPassFile !== undefined) {
     // Only the line break an editor adds is removed; the passphrase is otherwise taken as is.

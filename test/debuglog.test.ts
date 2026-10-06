@@ -41,3 +41,8 @@ test('client-supplied text cannot forge log lines', () => {
   assert.equal(describeCommand(['X\n2026-01-01T00:00:00.000Z [info] FAKE', 'a']), 'X\\x0a2026-01-01T00:00:00.000Z [INFO] FAKE "a"');
   assert.equal(describeReply(new ReplyError("unknown command 'X\r\nFAKE'")), "(error) ERR unknown command 'X\\x0d\\x0aFAKE'");
 });
+
+test('HELLO passwords are masked wherever AUTH appears', () => {
+  assert.equal(describeCommand(['HELLO', '3', 'SETNAME', 'AUTH', 'AUTH', 'default', 's3cret']), 'HELLO "3" "SETNAME" "AUTH" "AUTH" "default" "(redacted)"');
+  assert.equal(describeCommand(['HELLO', '3', 'AUTH', 'default', 's3cret', 'SETNAME', 'x']), 'HELLO "3" "AUTH" "default" "(redacted)" "SETNAME" "x"');
+});

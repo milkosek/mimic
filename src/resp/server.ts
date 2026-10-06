@@ -76,6 +76,8 @@ export interface RespServer extends net.Server {
   readonly stats: { connectedClients: number; totalConnections: number; totalCommands: number; rejectedConnections: number };
   /** Serve a connection accepted elsewhere (the TLS listener), with the same state and limits. */
   handleConnection(socket: net.Socket): void;
+  /** The INFO sections this server contributes (clients, stats, limits), for the HTTP API's INFO too. */
+  serverInfo(): InfoSections;
   /** Disconnect all clients (used on shutdown). */
   disconnectAll(): void;
   /** Stop listening to store changes (done automatically on 'close'; call it if listen() failed). */
@@ -165,6 +167,12 @@ class Connection implements ConnectionHandle {
       if (username === null) return 'nopass';
       return userOk ? 'ok' : 'wrongpass';
     }
+    // A blocked address gets no more guesses, also on connections it opened
+    // before the block: no comparison, and the connection is closed.
+    if (this.server.guard.isBlocked(this.socket.remoteAddress)) {
+      this.requestClose();
+      return 'wrongpass';
+    }
     // Always compare, even for an unknown user, so the reply time says nothing.
     const match = expected.matches(password);
     if (userOk && match) {
@@ -176,11 +184,15 @@ class Connection implements ConnectionHandle {
     return 'wrongpass';
   }
 
+  /** Set by the server when a password is required: (re)starts the login timer. */
+  onUnauthenticated: (() => void) | undefined;
+
   reset(): void {
     this.name = '';
     this.db = 0;
     this.protocol = 2;
     this.authenticated = !this.server.password;
+    if (!this.authenticated) this.onUnauthenticated?.(); // RESET logs out: the client must log in again in time
   }
 
   requestClose(): void {
@@ -561,12 +573,16 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
     }
     let authTimer: NodeJS.Timeout | undefined;
     if (authTimeoutMs > 0) {
-      authTimer = setTimeout(() => {
-        if (conn.authenticated || socket.destroyed) return;
-        logger?.debug?.(`[resp] client ${conn.id} closed: not authenticated within ${authTimeoutMs / 1000} s`);
-        socket.destroy();
-      }, authTimeoutMs);
-      authTimer.unref();
+      conn.onUnauthenticated = () => {
+        clearTimeout(authTimer);
+        authTimer = setTimeout(() => {
+          if (conn.authenticated || socket.destroyed) return;
+          logger?.debug?.(`[resp] client ${conn.id} closed: not authenticated within ${authTimeoutMs / 1000} s`);
+          socket.destroy();
+        }, authTimeoutMs);
+        authTimer.unref();
+      };
+      conn.onUnauthenticated();
     }
 
     socket.on('data', (chunk: Buffer) => {
@@ -592,6 +608,7 @@ export function createRespServer(store: Store, opts: RespServerOptions = {}): Re
 
   const server = net.createServer(handleConnection) as RespServer;
   server.handleConnection = handleConnection;
+  server.serverInfo = serverInfo;
 
   server.on('close', unsubscribe);
   server.dispose = () => {

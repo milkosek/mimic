@@ -850,6 +850,27 @@ export class Store extends Database {
     return this;
   }
 
+  #holders = 0;
+  #startedOutside = false;
+
+  /**
+   * Start the timer on behalf of one more user (a daemon). It keeps running
+   * until the last user calls release() - and for good if something else had
+   * already started it with start().
+   */
+  retain(): this {
+    if (this.#holders++ === 0) {
+      this.#startedOutside = this.running;
+      this.start();
+    }
+    return this;
+  }
+
+  release(): void {
+    if (this.#holders === 0) return;
+    if (--this.#holders === 0 && !this.#startedOutside) this.stop();
+  }
+
   /** Whether the background timer (active expiry, rehashing) is running. */
   get running(): boolean {
     return this.#timer !== null;

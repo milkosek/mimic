@@ -73,11 +73,18 @@ export async function startDaemon(config: MimicConfig, logger: Logger = NOOP_LOG
     databases: config.databases,
     maxMemoryPercent: config.maxMemoryPercent,
   });
-  // Only stop the timer later if this daemon started it (embedding code may own it).
-  const startedTimer = !store.running;
-  store.start();
+  // The store is a process-wide singleton: a second daemon in the same
+  // process shares it (and its options), and the timer runs until the last
+  // daemon closes.
+  const opts = store.info().config;
+  if (opts.databases !== config.databases || opts.cleanupIntervalMs !== config.cleanupIntervalMs || opts.maxMemoryPercent !== config.maxMemoryPercent) {
+    logger.warn('the store already exists in this process with other settings; --databases, --cleanup-* and --max-memory-percent keep their first values');
+  }
+  store.retain();
+  let released = false;
   const stopTimer = (): void => {
-    if (startedTimer) store.stop();
+    if (!released) store.release();
+    released = true;
   };
 
   let httpPort: number | null = null;
@@ -98,20 +105,49 @@ export async function startDaemon(config: MimicConfig, logger: Logger = NOOP_LOG
     extraInfo,
   });
 
+  // Raw sockets of the TLS listeners, including ones still in the handshake,
+  // which disconnectAll() / closeAllConnections() don't know about yet.
+  const tlsSockets = new Set<net.Socket>();
+  const trackSockets = (server: net.Server): void => {
+    server.on('connection', (socket: net.Socket) => {
+      tlsSockets.add(socket);
+      socket.once('close', () => tlsSockets.delete(socket));
+    });
+  };
+  // With --tls-auth-clients optional, a client may connect without a
+  // certificate - but one that presents a certificate that doesn't verify is
+  // refused, as Redis does.
+  const rejectUntrusted = (socket: tls.TLSSocket): boolean => {
+    if (config.tlsAuthClients !== 'optional' || socket.authorized) return false;
+    const cert = socket.getPeerCertificate();
+    if (!cert || Object.keys(cert).length === 0) return false;
+    logger.debug?.(`[tls] refused an untrusted client certificate from ${socket.remoteAddress}: ${socket.authorizationError}`);
+    socket.destroy();
+    return true;
+  };
+
   let respTls: tls.Server | null = null;
   let httpServer: http.Server | https.Server | null = null;
   let respPort: number | null = null;
   const stopAll = (): void => {
+    resp.disconnectAll(); // clients accepted before a later listener failed
     if (resp.listening) resp.close();
     if (respTls?.listening) respTls.close();
     if (httpServer?.listening) httpServer.close();
+    for (const sock of tlsSockets) sock.destroy();
     resp.dispose();
     stopTimer();
   };
   try {
     if (config.port !== null) respPort = await listen(resp, config.port, config.host);
     if (config.tlsPort !== null) {
-      respTls = tls.createServer(tlsOpts!, (socket) => resp.handleConnection(socket));
+      respTls = tls.createServer(tlsOpts!, (socket) => {
+        if (rejectUntrusted(socket)) return;
+        resp.handleConnection(socket);
+      });
+      // Connections still in the handshake count too, and are closed on shutdown.
+      respTls.maxConnections = config.maxClients;
+      trackSockets(respTls);
       // A failed handshake (wrong CA, no client certificate, plain text on the
       // TLS port...) is the client's problem, not an error of ours.
       respTls.on('tlsClientError', (err, socket) => {
@@ -131,8 +167,13 @@ export async function startDaemon(config: MimicConfig, logger: Logger = NOOP_LOG
         allowedOrigins: config.httpAllowedOrigins,
         allowedHosts: config.httpAllowedHosts,
         logger,
-        extraInfo: () => ({ ...extraInfo(), Clients: { connected_clients: resp.stats.connectedClients } }),
+        // The same INFO / CONFIG GET values as over RESP.
+        extraInfo: () => resp.serverInfo(),
       });
+      if (config.httpTls) {
+        trackSockets(httpServer);
+        httpServer.on('secureConnection', (socket: tls.TLSSocket) => rejectUntrusted(socket));
+      }
       httpPort = await listen(httpServer, config.httpPort, config.httpHost);
     }
   } catch (err) {
@@ -171,6 +212,7 @@ export async function startDaemon(config: MimicConfig, logger: Logger = NOOP_LOG
       closing.push(new Promise((r) => h.close(() => r())));
       (h as http.Server & { closeAllConnections?: () => void }).closeAllConnections?.();
     }
+    for (const s of tlsSockets) s.destroy(); // e.g. connections that never finished the TLS handshake
     await Promise.all(closing);
     resp.dispose(); // also when plain RESP never listened (TLS only)
   };

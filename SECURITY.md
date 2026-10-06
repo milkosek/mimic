@@ -74,7 +74,7 @@ What MIMIC protects against:
   - comparisons run in constant time, and AUTH arguments are masked in debug logs;
   - MIMIC warns about short passwords, password files others can read, and `--password` on the command line;
   - an empty password stops startup.
-- **Unauthenticated clients tying up resources:** they must log in within `--auth-timeout` seconds (default 10), get Redis' pre-AUTH limits (10 arguments, 16 KB each), and can't make MIMIC hold more than 256 KB of their input.
+- **Unauthenticated clients tying up resources:** they must finish a TLS handshake within 10 s and log in within `--auth-timeout` seconds (default 10, restarted by `RESET`), get Redis' pre-AUTH limits (10 arguments, 16 KB each), and can't make MIMIC hold more than 256 KB of their input. A blocked address gets no further guesses, also on connections it opened before the block.
 - **Web pages in a local browser** reaching the HTTP API or the RESP port:
   - HTTP requires `Content-Type: application/json`, refuses foreign `Origin`s and cross-site `Sec-Fetch-Site` requests, and checks `Host` against DNS rebinding when no password is set;
   - the Bearer token is only accepted with the `Bearer` scheme;
@@ -99,7 +99,7 @@ Take these into account when deploying.
 | **One password, full access** (no users or ACLs) | Any client with the password can use every enabled command in every database. | Disable what applications don't need (`--disable-commands`), and run separate instances for applications that must not see each other's data. |
 | **Expensive commands from authenticated clients** (`KEYS *`, `LRANGE 0 -1` on huge lists, `HGETALL` on huge hashes) | They block the server while they run, as in Redis. | `--disable-commands KEYS`, use SCAN; keep values and collections a sensible size; lower `--max-bulk-bytes`. |
 | **Certificates are read at startup** | Renewing a certificate needs a restart. | Restart MIMIC after renewing (a cache restart empties it). |
-| **No per-address connection limit** | One address can open up to `--max-clients` connections (unauthenticated ones are closed after `--auth-timeout`). | Restrict who can reach the port; lower `--max-clients` if needed. |
+| **No per-address connection limit** | One address can open up to `--max-clients` connections (unauthenticated ones are closed after `--auth-timeout`, and TLS handshakes must finish within 10 s). | Restrict who can reach the port; lower `--max-clients` if needed. |
 
 ## Deployment checklist
 
