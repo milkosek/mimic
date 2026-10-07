@@ -1,7 +1,6 @@
 {
   "name": "mimicache",
   "version": "0.3.0",
-  "private": true,
   "description": "MIMIC Is Merely an In-memory Cache: a small, zero-dependency, Redis-compatible in-memory cache server in pure Node.js. Built for IBM i (PASE) and anywhere else Redis can't be installed.",
   "keywords": [
     "cache",
@@ -17,6 +16,14 @@
   ],
   "license": "Apache-2.0",
   "author": "Mateusz Milkowski",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/milkosek/mimic.git"
+  },
+  "homepage": "https://github.com/milkosek/mimic#readme",
+  "bugs": {
+    "url": "https://github.com/milkosek/mimic/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

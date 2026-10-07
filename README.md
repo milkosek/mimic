@@ -17,7 +17,7 @@ I started this project partly out of noticing the gap for modernizing IBMi as a 
 - **An HTTP/JSON API as well**, for callers that have no Redis client, such as RPG or SQL on IBM i (through the `QSYS2.HTTP_*` functions), shell scripts or health checks.
 - **Memory only, on purpose.** Redis writes snapshots to disk by default. MIMIC never persists anything: a restart gives you an empty cache. It really is *merely* an in-memory cache.
 
-> Status: 0.3.0, the first public release. It isn't on npm yet; it will be published as `mimicache` (the name `mimic` is taken). See [Install](#install).
+> Status: 0.3.0, the first public release. On npm as [`mimicache`](https://www.npmjs.com/package/mimicache) (the name `mimic` is taken). See [Install](#install).
 
 ---
 
@@ -42,10 +42,17 @@ I started this project partly out of noticing the gap for modernizing IBMi as a 
 ## Quick start
 
 ```bash
-git clone <this repository> mimic && cd mimic
+npm install -g mimicache
+mimic              # RESP on 127.0.0.1:6379, HTTP on 127.0.0.1:6380
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/milkosek/mimic.git && cd mimic
 npm install
 npm run build
-npm start          # RESP on 127.0.0.1:6379, HTTP on 127.0.0.1:6380
+npm start
 ```
 
 ```bash
@@ -57,7 +64,11 @@ curl -s localhost:6380/command -H 'content-type: application/json' -d '["GET","g
 
 ## Install
 
-Until the package is on npm, build from source (see Quick start) and copy the folder wherever you need it. The build output in `dist/` is plain JavaScript, so you can build on your PC and copy `dist/`, `package.json` and `LICENSE` to the server. Nothing else is needed at runtime.
+**From npm:** `npm install -g mimicache` installs the `mimic` command (also available as `mimicache`). Without a global install, `npm install mimicache` in a folder of your own, then run `npx mimic` there. The package contains only the built JavaScript, the examples and the licence files: no build step, and no dependencies to download.
+
+**From source:** clone the repository and build it (see Quick start). The build output in `dist/` is plain JavaScript, so you can also build on your PC and copy `dist/`, `package.json` and `LICENSE` to the server. Nothing else is needed at runtime.
+
+Every [GitHub release](https://github.com/milkosek/mimic/releases) also has the npm package attached as a `.tgz`, for servers without access to npm: unpack it with `tar -xzf` and run `node package/dist/cli.js`.
 
 TypeScript is pinned to 6.x on purpose. TypeScript 7's native compiler ships per-platform binaries and may not install on IBM i, while 6.x is plain JavaScript that runs anywhere Node runs, so `npm run build` works on IBM i too. The code also compiles cleanly with TypeScript 7.
 
@@ -70,9 +81,9 @@ TypeScript is pinned to 6.x on purpose. TypeScript 7's native compiler ships per
    yum install nodejs22           # or the newest LTS listed
    ```
 
-2. **Put MIMIC in the IFS**, e.g. `/home/MYUSER/mimic` (clone and build it there, or copy a build from your PC).
+2. **Install MIMIC.** Either from npm (`npm install -g mimicache`, which needs write access to Node's install directory; otherwise run `npm install mimicache` in a folder of your own, e.g. `/home/MYUSER/mimic`), or put a source build in the IFS, e.g. `/home/MYUSER/mimic` (clone and build it there, or copy a build from your PC).
 
-3. **Start it.** The simplest way is with [Service Commander](https://github.com/ThePrez/ServiceCommander-IBMi). Copy [`examples/ibmi/mimic.yaml`](examples/ibmi/mimic.yaml) to `~/.sc/services/`, adjust `dir`, and then:
+3. **Start it.** The simplest way is with [Service Commander](https://github.com/ThePrez/ServiceCommander-IBMi). Copy [`examples/ibmi/mimic.yaml`](examples/ibmi/mimic.yaml) to `~/.sc/services/`, adjust `dir` (and `start_cmd`, e.g. to `mimic` if you installed from npm), and then:
 
    ```sh
    sc start mimic
