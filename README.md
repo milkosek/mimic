@@ -2,7 +2,7 @@
 
 **MIMIC Is Merely an In-memory Cache.** MIMIC is a small, Redis-compatible, in-memory cache server written in pure Node.js. It's a recursive acronym in the GNU / WINE tradition, and a nod to all good TTRPG adventures. It is not what it looks like it is.
 
-Redis is great, but you can't always install it. **IBM i (PASE)** is the example: Node.js runs there, but Redis doesn't. MIMIC fills that gap. It speaks the Redis protocol, so existing Redis clients just connect to it, and it needs nothing beyond Node.js 18 or newer.
+Redis is great, but you can't always install it, or install a current version of it. **IBM i (PASE)** is the example: Node.js runs there, but the Redis package in the IBM i open-source repository is an old release from 2021 (see [Redis on IBM i](#redis-on-ibm-i)). MIMIC fills that gap. It speaks the Redis protocol, so existing Redis clients just connect to it, and it needs nothing beyond Node.js 18 or newer.
 
 **IMPORTANT NOTE** MIMIC does **NOT** replace Redis and is a far cry of functionality behind the actual Redis. It is merely a substitute for simple use cases where Redis itself can't be installed.
 
@@ -73,6 +73,26 @@ Every [GitHub release](https://github.com/milkosek/mimic/releases) also has the 
 TypeScript is pinned to 6.x on purpose. TypeScript 7's native compiler ships per-platform binaries and may not install on IBM i, while 6.x is plain JavaScript that runs anywhere Node runs, so `npm run build` works on IBM i too. The code also compiles cleanly with TypeScript 7.
 
 ## Running on IBM i
+
+### Redis on IBM i
+
+The IBM i open-source repository does have a Redis package (`yum install redis`), but it is an outdated release: 6.0.10 at the time of writing, from early 2021. Redis has published many security fixes since then, several of them for Lua scripting. Check whether IBM's package includes backported fixes (`yum info redis` and the package changelog) before relying on it. If a current Redis is available to you, use it.
+
+MIMIC is for when it isn't, or when you need what MIMIC brings:
+
+- **Current, focused security work**, made for running next to IBM i workloads (see [Security](#security) and [SECURITY.md](SECURITY.md)):
+  - TLS for the Redis protocol and HTTPS for the API, with certificates exported from Digital Certificate Manager (PKCS#12), and optional client certificates;
+  - protected mode, so a cache without a password only serves this machine;
+  - per-address blocking after repeated failed logins, a login timeout, and the password stored as a hash if you like;
+  - `--disable-commands` for commands an application never needs;
+  - no scripting engine at all, so the Lua problems Redis has had don't apply.
+- **An HTTP/JSON API** for RPG, COBOL and SQL through `QSYS2.HTTP_*`, which Redis doesn't offer.
+- **Pure JavaScript on Node.js:** nothing native to install, and a code base small enough to review.
+- **`-OOM` instead of a crashed process** when memory runs out.
+
+What Redis 6.0 still has and MIMIC doesn't: persistence, replication, users and ACLs, sets, sorted sets, streams, pub/sub, scripting and more (see [Differences from Redis](#differences-from-redis)).
+
+### Setting it up
 
 1. **Install Node.js** (open-source RPMs, via ACS or `yum`). MIMIC runs on Node.js 18 or newer, but pick a release that still gets security updates (Node.js 22 or 24 at the time of writing; Node.js 18 and 20 have reached end-of-life):
 
